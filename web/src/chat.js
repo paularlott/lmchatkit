@@ -280,6 +280,7 @@ if (window.Alpine && typeof window.Alpine.data === "function") {
 }
 
 function webchat({ prefix }) {
+  let _msgSeq = 0;
   return {
     prefix,
     personas: [{ id: "default", name: "Default" }],
@@ -771,7 +772,7 @@ function webchat({ prefix }) {
         }
       }
 
-      this.messages.push({ role: "user", content: draft });
+      this.messages.push({ id: "msg-" + (++_msgSeq), role: "user", content: draft });
       this.draft = "";
       // Auto-title from first user message
       const c = this.current();
@@ -810,7 +811,7 @@ function webchat({ prefix }) {
       // delta arrives; if the fetch fails we put an error message into
       // this same bubble rather than spawning a new one.
       this.messages.push({
-        role: "assistant",
+        id: "msg-" + (++_msgSeq), role: "assistant",
         content: "",
         thinking: "",
         showThinking: false,
@@ -1054,7 +1055,7 @@ function webchat({ prefix }) {
       call.result = "[denied by user]";
       // Append a tool message so the model knows the user declined.
       this.messages.push({
-        role: "tool",
+        id: "msg-" + (++_msgSeq), role: "tool",
         tool_call_id: call.id,
         tool_name: call.name,
         content: "[denied by user]",
@@ -1116,7 +1117,7 @@ function webchat({ prefix }) {
         call.result = content;
         call.isError = !!data.is_error;
         this.messages.push({
-          role: "tool",
+          id: "msg-" + (++_msgSeq), role: "tool",
           tool_call_id: call.id,
           tool_name: call.name,
           content,
@@ -1126,7 +1127,7 @@ function webchat({ prefix }) {
         call.result = "[error] " + e.message;
         call.isError = true;
         this.messages.push({
-          role: "tool",
+          id: "msg-" + (++_msgSeq), role: "tool",
           tool_call_id: call.id,
           tool_name: call.name,
           content: "[error] " + e.message,
@@ -1193,7 +1194,7 @@ function webchat({ prefix }) {
         sessionStorage.setItem("webchat:autoAllow", JSON.stringify(this.autoAllowTools));
       }
       const rendered = (cmd.body || "").replaceAll("$ARGUMENTS", args);
-      this.messages.push({ role: "user", content: rendered });
+      this.messages.push({ id: "msg-" + (++_msgSeq), role: "user", content: rendered });
       this.scrollToBottom();
       this.persist();
       await this.streamTurn();
