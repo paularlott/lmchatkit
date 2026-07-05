@@ -1,0 +1,279 @@
+package webchat
+
+import (
+	"encoding/json"
+	"net/http"
+)
+
+// handlePersonas returns the persona snapshot. Always an array — a built-in
+// Default persona is included even when no source is configured.
+func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request) {
+	personas := []Persona{{ID: "default", Name: "Default"}}
+	if s.personas != nil {
+		if got, err := s.personas.Personas(r.Context()); err == nil && len(got) > 0 {
+			personas = got
+		}
+	}
+	writeJSON(w, http.StatusOK, personas)
+}
+
+// handleCommands returns the slash-command snapshot including the rendered
+// markdown body. Bodies are small (typical command file is <1KB) and the
+// count is bounded by what fits in the source, so we ship them in the
+// listing rather than adding a per-command endpoint.
+//
+// Always returns a JSON array, even when no source is configured — JSON
+// null would force every client to defend against null in addition to empty.
+func (s *Server) handleCommands(w http.ResponseWriter, r *http.Request) {
+	cmds := []SlashCommand{}
+	if s.commands != nil {
+		if got, err := s.commands.Commands(r.Context()); err == nil && len(got) > 0 {
+			cmds = got
+		}
+	}
+	writeJSON(w, http.StatusOK, cmds)
+}
+
+// handleModels proxies the host's model list.
+func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	models, err := s.host.Models(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if models == nil {
+		models = []Model{}
+	}
+	writeJSON(w, http.StatusOK, models)
+}
+
+// chatRequest is the body shape expected by POST /api/chat. Messages is the
+// full conversation. PersonaParams and PersonaSystemPrompt are pre-merged by
+// the frontend (or, if the frontend passed a PersonaID, the backend will
+// merge here) — kept simple: frontend merges persona, sends everything
+// explicitly. PersonaID is captured for analytics only.
+type chatRequest struct {
+	Model             string                 `json:"model"`
+	Messages          []Message              `json:"messages"`
+	Tools             []Tool                 `json:"tools,omitempty"`
+	Params            map[string]interface{} `json:"params,omitempty"`
+	DisabledTools     []string               `json:"disabled_tools,omitempty"`
+}
+
+// handleListTools returns the tools currently available to chat — i.e. the
+// host's full tool list minus anything the user has disabled. The disabled
+// list is sent by the frontend (per-session LocalStorage) so different users
+// on the same host can have different tool sets without host-level config.
+func (s *Server) handleListTools(w http.ResponseWriter, r *http.Request) {
+	tools, err := s.host.ListTools(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	disabled := querySlice(r, "disabled")
+	if len(disabled) == 0 {
+		// Try the JSON-body path as well (some clients POST a list).
+		if r.Method == http.MethodPost {
+			var body struct{ Disabled []string `json:"disabled"` }
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			disabled = body.Disabled
+		}
+	}
+	if len(disabled) == 0 {
+		writeJSON(w, http.StatusOK, tools)
+		return
+	}
+	set := make(map[string]bool, len(disabled))
+	for _, d := range disabled {
+		set[d] = true
+	}
+	out := make([]Tool, 0, len(tools))
+	for _, t := range tools {
+		if !set[t.Name] {
+			out = append(out, t)
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// toolCallRequest is the body shape for /api/tools/call.
+type toolCallRequest struct {
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+// handleCallTool invokes a tool. The frontend calls this after the user
+// confirms a tool call from the model's response.
+func (s *Server) handleCallTool(w http.ResponseWriter, r *http.Request) {
+	var req toolCallRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	res, err := s.host.CallTool(r.Context(), req.Name, req.Arguments)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleListPrompts proxies the host's prompt list.
+func (s *Server) handleListPrompts(w http.ResponseWriter, r *http.Request) {
+	prompts, err := s.host.ListPrompts(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, prompts)
+}
+
+// promptGetRequest is the body shape for /api/prompts/get.
+type promptGetRequest struct {
+	Name string            `json:"name"`
+	Args map[string]string `json:"args,omitempty"`
+}
+
+// handleGetPrompt renders a prompt by name with arguments.
+func (s *Server) handleGetPrompt(w http.ResponseWriter, r *http.Request) {
+	var req promptGetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	res, err := s.host.GetPrompt(r.Context(), req.Name, req.Args)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleListResources proxies the host's resource list.
+func (s *Server) handleListResources(w http.ResponseWriter, r *http.Request) {
+	resources, err := s.host.ListResources(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resources)
+}
+
+// resourceReadRequest is the body shape for /api/resources/read.
+type resourceReadRequest struct {
+	URI string `json:"uri"`
+}
+
+// handleReadResource reads a resource by URI.
+func (s *Server) handleReadResource(w http.ResponseWriter, r *http.Request) {
+	var req resourceReadRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.URI == "" {
+		writeError(w, http.StatusBadRequest, "uri is required")
+		return
+	}
+	res, err := s.host.ReadResource(r.Context(), req.URI)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleAsset serves a file from the embedded JS/CSS bundle. The bundle is
+// tiny (no minification, no chunking) so a simple lookup is enough; we set
+// long-lived cache headers because the assets change only on binary upgrade.
+func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
+	rel := r.URL.Path[len(s.cfg.Prefix)+len("/assets/"):]
+	if rel == "" {
+		http.NotFound(w, r)
+		return
+	}
+	data, err := assetsFS.ReadFile("web/src/" + rel)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	switch extOf(rel) {
+	case ".js":
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	case ".css":
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	default:
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+func extOf(name string) string {
+	for i := len(name) - 1; i >= 0; i-- {
+		if name[i] == '.' {
+			return name[i:]
+		}
+		if name[i] == '/' {
+			break
+		}
+	}
+	return ""
+}
+
+// writeJSON writes a JSON response with the standard helper. Inline rather
+// than imported from admin so this package stays self-contained.
+func writeJSON(w http.ResponseWriter, status int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeError writes an error response in the conventional {error: ...} shape.
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
+}
+
+// querySlice splits a comma-separated query parameter into a slice.
+func querySlice(r *http.Request, key string) []string {
+	v := r.URL.Query()[key]
+	if len(v) == 0 {
+		return nil
+	}
+	var out []string
+	for _, item := range v {
+		for _, part := range splitCSV(item) {
+			if part != "" {
+				out = append(out, part)
+			}
+		}
+	}
+	return out
+}
+
+// splitCSV is a tiny helper to keep the import block small; comma splitting
+// only, no quoting. Lower-latency than pulling encoding/csv.
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == ',' {
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	out = append(out, s[start:])
+	return out
+}
