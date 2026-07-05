@@ -303,6 +303,20 @@ function webchat({ prefix }) {
     slashOpen: false,
     slashIndex: 0,
 
+    // MCP prompts + resources (loaded from API on init).
+    prompts: [],
+    resources: [],
+
+    // /prompt autocomplete: when draft starts with "/prompt " show a
+    // dropdown of available MCP prompts.
+    promptMenuOpen: false,
+    promptMenuIndex: 0,
+
+    // @resource autocomplete: when draft ends with "@<partial>" show a
+    // dropdown of available resources.
+    resourceMenuOpen: false,
+    resourceMenuIndex: 0,
+
     // AbortController for the in-flight /api/chat request. Nulled when the
     // turn finishes (cleanly, errored, or cancelled). The Cancel button is
     // visible iff this is non-null AND streaming is true.
@@ -368,6 +382,8 @@ function webchat({ prefix }) {
         this.loadModels(),
         this.loadCommands(),
         this.loadTools(),
+        this.loadPrompts(),
+        this.loadResources(),
       ]).then(() => {
         // Auto-start: if the host only offers one persona and one model
         // (e.g. knot's single-tenant system-defined setup), skip the picker
@@ -383,9 +399,18 @@ function webchat({ prefix }) {
       // Auto-grow the textarea on input, plus toggle slash autocomplete.
       this.$watch("draft", () => {
         this.autosize();
+        // Slash command autocomplete
         const matches = this.slashMatches;
         this.slashOpen = matches.length > 0 && !this.draft.includes(" ");
         if (this.slashIndex >= matches.length) this.slashIndex = Math.max(0, matches.length - 1);
+        // /prompt autocomplete: after "/prompt " show prompt names
+        const pm = this.promptMenuMatches;
+        this.promptMenuOpen = pm.length > 0;
+        if (this.promptMenuIndex >= pm.length) this.promptMenuIndex = 0;
+        // @resource autocomplete: when draft ends with @<partial>
+        const rm = this.resourceMenuMatches;
+        this.resourceMenuOpen = rm.length > 0;
+        if (this.resourceMenuIndex >= rm.length) this.resourceMenuIndex = 0;
       });
 
       // Restore saved conversations + the chat that was last open so a
@@ -417,8 +442,10 @@ function webchat({ prefix }) {
     // -- loaders -----------------------------------------------------------
     async loadPersonas() {
       try {
-        const r = await fetch(`${this.prefix}/api/personas`, {});
+        const r = await fetch(`${this.prefix}/api/personas`, { headers: this._etagHeaders("personas") });
+        if (r.status === 304) return;
         if (r.ok) {
+          this._storeETag("personas", r);
           const data = await r.json();
           if (Array.isArray(data)) this.personas = data;
         }
@@ -426,8 +453,10 @@ function webchat({ prefix }) {
     },
     async loadModels() {
       try {
-        const r = await fetch(`${this.prefix}/api/models`, {});
+        const r = await fetch(`${this.prefix}/api/models`, { headers: this._etagHeaders("models") });
+        if (r.status === 304) return;
         if (r.ok) {
+          this._storeETag("models", r);
           const data = await r.json();
           if (Array.isArray(data)) {
             this.models = data;
@@ -440,26 +469,69 @@ function webchat({ prefix }) {
     },
     async loadCommands() {
       try {
-        const r = await fetch(`${this.prefix}/api/commands`, {});
+        const r = await fetch(`${this.prefix}/api/commands`, { headers: this._etagHeaders("commands") });
+        if (r.status === 304) return;
         if (r.ok) {
+          this._storeETag("commands", r);
           const data = await r.json();
-          // Server returns JSON null when no CommandsDir is configured; treat
-          // that as "no commands" rather than clobbering our empty default.
           this.commands = Array.isArray(data) ? data : [];
         }
       } catch {}
     },
     async loadTools() {
       try {
-        const r = await fetch(`${this.prefix}/api/tools`, {});
+        const r = await fetch(`${this.prefix}/api/tools`, { headers: this._etagHeaders("tools") });
+        if (r.status === 304) return;
         if (r.ok) {
+          this._storeETag("tools", r);
           const data = await r.json();
           if (Array.isArray(data)) {
+            const prevEnabled = new Set(this.enabledTools);
             this.allTools = data;
-            this.enabledTools = this.allTools.map((t) => t.name);
+            this.enabledTools = prevEnabled.size > 0
+              ? this.allTools.filter((t) => prevEnabled.has(t.name)).map((t) => t.name)
+              : this.allTools.map((t) => t.name);
+            if (this.enabledTools.length === 0) {
+              this.enabledTools = this.allTools.map((t) => t.name);
+            }
           }
         }
       } catch {}
+    },
+    async loadPrompts() {
+      try {
+        const r = await fetch(`${this.prefix}/api/prompts`, { headers: this._etagHeaders("prompts") });
+        if (r.status === 304) return;
+        if (r.ok) {
+          this._storeETag("prompts", r);
+          const data = await r.json();
+          this.prompts = Array.isArray(data) ? data : [];
+        }
+      } catch {}
+    },
+    async loadResources() {
+      try {
+        const r = await fetch(`${this.prefix}/api/resources`, { headers: this._etagHeaders("resources") });
+        if (r.status === 304) return;
+        if (r.ok) {
+          this._storeETag("resources", r);
+          const data = await r.json();
+          this.resources = Array.isArray(data) ? data : [];
+        }
+      } catch {}
+    },
+
+    // ETag helpers: store the server's ETag per endpoint and send it back
+    // as If-None-Match on subsequent requests. On 304 the data hasn't
+    // changed — skip parsing entirely.
+    _etags: {},
+    _etagHeaders(key) {
+      const etag = this._etags[key];
+      return etag ? { "If-None-Match": etag } : {};
+    },
+    _storeETag(key, resp) {
+      const etag = resp.headers.get("ETag");
+      if (etag) this._etags[key] = etag;
     },
 
     // -- persona helpers ---------------------------------------------------
@@ -672,6 +744,18 @@ function webchat({ prefix }) {
         this.selectSlashCommand(this.slashMatches[this.slashIndex]);
         return;
       }
+      if (this.promptMenuOpen) {
+        e.preventDefault();
+        const m = this.promptMenuMatches[this.promptMenuIndex];
+        if (m) this.selectPromptFromMenu(m);
+        return;
+      }
+      if (this.resourceMenuOpen) {
+        e.preventDefault();
+        const m = this.resourceMenuMatches[this.resourceMenuIndex];
+        if (m) this.selectResourceFromMenu(m);
+        return;
+      }
       if (e.isComposing) return;
       if (e.shiftKey) return;
       e.preventDefault();
@@ -680,21 +764,17 @@ function webchat({ prefix }) {
 
     // -- input history (shell-style Up/Down) -----------------------------
     onArrowUp(e) {
-      if (this.slashOpen) {
-        e.preventDefault();
-        this.slashIndex = Math.max(0, this.slashIndex - 1);
-        return;
-      }
+      if (this.slashOpen) { e.preventDefault(); this.slashIndex = Math.max(0, this.slashIndex - 1); return; }
+      if (this.promptMenuOpen) { e.preventDefault(); this.promptMenuIndex = Math.max(0, this.promptMenuIndex - 1); return; }
+      if (this.resourceMenuOpen) { e.preventDefault(); this.resourceMenuIndex = Math.max(0, this.resourceMenuIndex - 1); return; }
       if (!this.shouldNavigateHistory("up", e.target)) return;
       e.preventDefault();
       this.navigateHistory("up");
     },
     onArrowDown(e) {
-      if (this.slashOpen) {
-        e.preventDefault();
-        this.slashIndex = Math.min(this.slashMatches.length - 1, this.slashIndex + 1);
-        return;
-      }
+      if (this.slashOpen) { e.preventDefault(); this.slashIndex = Math.min(this.slashMatches.length - 1, this.slashIndex + 1); return; }
+      if (this.promptMenuOpen) { e.preventDefault(); this.promptMenuIndex = Math.min(this.promptMenuMatches.length - 1, this.promptMenuIndex + 1); return; }
+      if (this.resourceMenuOpen) { e.preventDefault(); this.resourceMenuIndex = Math.min(this.resourceMenuMatches.length - 1, this.resourceMenuIndex + 1); return; }
       if (!this.shouldNavigateHistory("down", e.target)) return;
       e.preventDefault();
       this.navigateHistory("down");
@@ -757,28 +837,48 @@ function webchat({ prefix }) {
       const draft = this.draft.trim();
       if (!draft || this.streaming) return;
 
-      // New user turn: re-enable auto-scroll so the transcript follows the
-      // forthcoming response. Without this, a user who scrolled up to read
-      // earlier output would miss the new turn entirely.
       this.userHasScrolled = false;
-
-      // Record into the shared input history BEFORE clearing the field so
-      // Up-arrow recalls the just-sent message. Dedupe + cap so the list
-      // stays useful as the user iterates.
       this.recordInputHistory(draft);
 
-      // Slash command?
+      // Built-in meta commands (don't go to the model)
+      if (draft === "/list-prompts") {
+        this.draft = "";
+        this.renderInfoCard("prompts", "Available MCP Prompts",
+          (this.prompts || []).map((p) => ({
+            name: "/" + p.name + (p.arguments && p.arguments.length ? " " + p.arguments.map(a => a.name + (a.required ? "*" : "")).join(" ") : ""),
+            description: p.description || "",
+          })));
+        return;
+      }
+      if (draft === "/list-resources") {
+        this.draft = "";
+        this.renderInfoCard("resources", "Available MCP Resources",
+          (this.resources || []).map((r) => ({
+            name: r.uri,
+            description: r.name || "",
+            args: r.template ? "(template)" : "",
+          })));
+        return;
+      }
+
+      // File-based slash commands + MCP prompts share the /namespace.
+      // File commands are checked first; if no match, fall through to MCP
+      // prompts. Both are handled inside handleSlash.
       if (draft.startsWith("/")) {
+        this.draft = "";
         const handled = await this.handleSlash(draft);
         if (handled) {
-          this.draft = "";
           return;
         }
       }
 
-      this.messages.push({ id: "msg-" + (++_msgSeq), role: "user", content: draft });
+      // Normal message — @resource URIs in the text are resolved
+      // server-side. The browser sends the text as-is; the server
+      // reads the resources and builds content blocks. No client-side
+      // fetch or attachment handling needed.
+      const msg = { id: "msg-" + (++_msgSeq), role: "user", content: draft };
+      this.messages.push(msg);
       this.draft = "";
-      // Auto-title from first user message
       const c = this.current();
       if (c && c.title === "New conversation") {
         c.title = draft.slice(0, 50);
@@ -786,6 +886,20 @@ function webchat({ prefix }) {
       this.scrollToBottom();
       this.persist();
       await this.streamTurn();
+    },
+
+    // renderInfoCard pushes a synthetic assistant message with an `info`
+    // object instead of text content. The template renders info cards
+    // specially (no markdown, just a formatted list).
+    renderInfoCard(kind, title, items) {
+      this.messages.push({
+        id: "msg-" + (++_msgSeq),
+        role: "assistant",
+        content: "",
+        info: { kind, title, items },
+      });
+      this.scrollToBottom();
+      this.persist();
     },
 
     // recordInputHistory appends to the shared input history. Consecutive
@@ -849,7 +963,7 @@ function webchat({ prefix }) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             model: this.currentModel,
-            messages: this.messages.slice(0, -1), // exclude the empty bubble we just pushed
+            messages: this.messages.slice(0, -1),
             tools,
             params,
           }),
@@ -926,7 +1040,14 @@ function webchat({ prefix }) {
             }
             this.scrollToBottom();
           } else if (ev.type === "done") {
-            // finalize — handled below
+            // Refresh MCP content after each turn — tools, prompts, and
+            // resources may have changed (e.g. a tool call registered
+            // new content, or the operator added a persona). Fire-and-
+            // forget; the dropdowns will be fresh next time the user
+            // types / or @. No ticker, no polling.
+            this.loadTools();
+            this.loadPrompts();
+            this.loadResources();
           } else if (ev.type === "error") {
             reactiveAssistant.content += `[stream error] ${ev.error}`;
           }
@@ -1149,8 +1270,21 @@ function webchat({ prefix }) {
     get slashMatches() {
       if (!this.draft.startsWith("/")) return [];
       const name = this.draft.slice(1).split(/\s/)[0].toLowerCase();
-      if (!name) return (this.commands || []).slice();
-      return (this.commands || []).filter((c) => c.name.startsWith(name));
+      const builtins = [
+        { id: "_list-prompts", name: "list-prompts", description: "List available MCP prompts", _builtin: true },
+        { id: "_list-resources", name: "list-resources", description: "List available MCP resources", _builtin: true },
+      ];
+      // MCP prompts merge into the namespace as slash commands.
+      const promptCmds = (this.prompts || []).map((p) => ({
+        id: "prompt:" + p.name,
+        name: p.name,
+        description: p.description || "",
+        argument_hint: (p.arguments || []).map((a) => a.name + (a.required ? "*" : "")).join(" "),
+        _isPrompt: true,
+      }));
+      const all = [...builtins, ...(this.commands || []), ...promptCmds];
+      if (!name) return all;
+      return all.filter((c) => c.name.startsWith(name));
     },
 
     get commandHint() {
@@ -1163,16 +1297,76 @@ function webchat({ prefix }) {
     selectSlashCommand(cmd) {
       if (!cmd) return;
       this.slashOpen = false;
-      // If the command body doesn't use $ARGUMENTS, it takes no arguments —
-      // submit immediately rather than leaving the user with a pending draft
-      // and an extra Enter press.
+      // MCP prompt: if it declares arguments, wait for the user to type
+      // them. If not, submit immediately.
+      if (cmd._isPrompt) {
+        if (cmd.argument_hint) {
+          this.draft = "/" + cmd.name + " ";
+          this.$nextTick(() => this.$refs.composer && this.$refs.composer.focus());
+          return;
+        }
+        this.draft = "/" + cmd.name;
+        this.send();
+        return;
+      }
+      // File-based or built-in: if the command body doesn't use $ARGUMENTS
+      // (or has no body), submit immediately.
       if (!cmd.body || !cmd.body.includes("$ARGUMENTS")) {
         this.draft = "/" + cmd.name;
         this.send();
         return;
       }
-      // Command expects arguments — fill the name and let the user type.
       this.draft = "/" + cmd.name + " ";
+      this.$nextTick(() => this.$refs.composer && this.$refs.composer.focus());
+    },
+
+    // -- /prompt autocomplete ---------------------------------------------
+    get promptMenuMatches() {
+      if (!this.draft.startsWith("/prompt ")) return [];
+      const rest = this.draft.slice(8).trim();
+      if (rest.includes(" ")) return [];
+      if (!rest) return (this.prompts || []).slice();
+      return (this.prompts || []).filter((p) => p.name.toLowerCase().startsWith(rest.toLowerCase()));
+    },
+
+    selectPromptFromMenu(p) {
+      this.draft = "/prompt " + p.name + " ";
+      this.promptMenuOpen = false;
+      this.$nextTick(() => this.$refs.composer && this.$refs.composer.focus());
+    },
+
+    // -- @resource autocomplete -------------------------------------------
+    get resourceMenuMatches() {
+      const m = this.draft.match(/@([\w:/.{}-]*)$/);
+      if (!m) return [];
+      const partial = m[1].toLowerCase();
+      // Show all resources — static and template. Template resources
+      // ({var} placeholders) are matched on their scheme prefix so
+      // @greet finds greeting://{name} even though {name} != "greet".
+      const all = this.resources || [];
+      if (!partial) return all.slice(0, 10);
+      return all.filter((r) => {
+        // For templates, match against the prefix before the first {.
+        const matchUri = r.uri.includes("{")
+          ? r.uri.substring(0, r.uri.indexOf("{")).toLowerCase()
+          : r.uri.toLowerCase();
+        return matchUri.includes(partial) || (r.name || "").toLowerCase().includes(partial);
+      }).slice(0, 10);
+    },
+
+    selectResourceFromMenu(r) {
+      this.resourceMenuOpen = false;
+      // Static: insert the full URI (@docs://test.md).
+      // Template: insert everything up to the first {var} and leave
+      // the cursor for the user to type the value
+      // (@greeting:// — user types "Ada" → @greeting://Ada).
+      let insert;
+      if (r.uri.includes("{")) {
+        insert = r.uri.substring(0, r.uri.indexOf("{"));
+      } else {
+        insert = r.uri;
+      }
+      this.draft = this.draft.replace(/@([\w:/.{}-]*)$/, "@" + insert);
       this.$nextTick(() => this.$refs.composer && this.$refs.composer.focus());
     },
 
@@ -1181,28 +1375,77 @@ function webchat({ prefix }) {
       const sp = trimmed.indexOf(" ");
       const name = (sp === -1 ? trimmed.slice(1) : trimmed.slice(1, sp)).toLowerCase();
       const args = sp === -1 ? "" : trimmed.slice(sp + 1).trim();
+
+      // 1. File-based slash commands take precedence.
       const cmd = (this.commands || []).find((c) => c.name === name);
-      if (!cmd) return false;
-      // If the command declares allowed-tools in frontmatter, add them
-      // to the session-global auto-allow set so the model can call them
-      // without prompting. Format: comma-separated tool names, optionally
-      // with Claude-style patterns like Bash(git:*) — we strip the pattern
-      // for now and match on tool name only.
-      if (cmd.allowed_tools) {
-        for (const raw of cmd.allowed_tools.split(",")) {
-          const toolName = raw.trim().split("(")[0].trim();
-          if (toolName && !this.autoAllowTools.includes(toolName)) {
-            this.autoAllowTools.push(toolName);
+      if (cmd) {
+        if (cmd.allowed_tools) {
+          for (const raw of cmd.allowed_tools.split(",")) {
+            const toolName = raw.trim().split("(")[0].trim();
+            if (toolName && !this.autoAllowTools.includes(toolName)) {
+              this.autoAllowTools.push(toolName);
+            }
+          }
+          sessionStorage.setItem("webchat:autoAllow", JSON.stringify(this.autoAllowTools));
+        }
+        const rendered = (cmd.body || "").replaceAll("$ARGUMENTS", args);
+        this.messages.push({ id: "msg-" + (++_msgSeq), role: "user", content: rendered });
+        this.scrollToBottom();
+        this.persist();
+        await this.streamTurn();
+        return true;
+      }
+
+      // 2. MCP prompts: if the name matches a prompt, parse args and
+      // call prompts/get. Supports key=value pairs and positional
+      // shorthand for single-arg prompts.
+      const prompt = (this.prompts || []).find((p) => p.name === name);
+      if (prompt) {
+        const argParts = args ? args.split(/\s+/) : [];
+        const parsedArgs = {};
+        const declared = prompt.arguments || [];
+        const requiredArgs = declared.filter((a) => a.required);
+        const hasPositional = argParts.length > 0 && !argParts[0].includes("=");
+        if (hasPositional && requiredArgs.length === 1) {
+          // Single required arg: treat the whole remainder as its value.
+          // `/explain mcp` → {concept: "mcp"} even though there's also an
+          // optional "level" arg. Optional args are left unset.
+          parsedArgs[requiredArgs[0].name] = argParts.join(" ");
+        } else {
+          for (const part of argParts) {
+            const eq = part.indexOf("=");
+            if (eq > 0) parsedArgs[part.substring(0, eq)] = part.substring(eq + 1);
           }
         }
-        sessionStorage.setItem("webchat:autoAllow", JSON.stringify(this.autoAllowTools));
+        try {
+          const r = await fetch(`${this.prefix}/api/prompts/get`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name, args: parsedArgs }),
+          });
+          if (!r.ok) {
+            const err = await r.json().catch(() => ({ error: `server returned ${r.status}` }));
+            this.messages.push({ id: "msg-" + (++_msgSeq), role: "assistant", content: `[error] Prompt "${name}" failed: ${err.error || r.status}` });
+            this.scrollToBottom();
+            return true;
+          }
+          const data = await r.json();
+          if (data.messages && data.messages.length > 0) {
+            for (const m of data.messages) {
+              this.messages.push({ id: "msg-" + (++_msgSeq), role: m.role, content: m.content });
+            }
+            this.scrollToBottom();
+            this.persist();
+            await this.streamTurn();
+          }
+        } catch (e) {
+          this.messages.push({ id: "msg-" + (++_msgSeq), role: "assistant", content: `[error] Failed to render prompt: ${e.message}` });
+          this.scrollToBottom();
+        }
+        return true;
       }
-      const rendered = (cmd.body || "").replaceAll("$ARGUMENTS", args);
-      this.messages.push({ id: "msg-" + (++_msgSeq), role: "user", content: rendered });
-      this.scrollToBottom();
-      this.persist();
-      await this.streamTurn();
-      return true;
+
+      return false;
     },
 
     // -- UI helpers --------------------------------------------------------

@@ -20,7 +20,7 @@ func OpenAIChatRequest(req CompleteRequest) map[string]interface{} {
 	messages := make([]map[string]interface{}, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		msg := map[string]interface{}{"role": string(m.Role)}
-		if m.Content != "" {
+		if m.Content != nil && m.Content != "" {
 			msg["content"] = m.Content
 		}
 		if m.ToolCallID != "" {

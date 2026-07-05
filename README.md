@@ -202,8 +202,9 @@ $ARGUMENTS
 ```
 
 Frontmatter fields:
-- `description` — shown in the command selection menu (when implemented)
-- `argument-hint` — placeholder hint shown after the command name in the menu (e.g. `<github-handle>`)
+- `description` — shown in the slash command dropdown
+- `argument-hint` — placeholder hint shown after the command name (e.g. `<github-handle>`)
+- `allowed-tools` — comma-separated tool names to auto-approve for this session when the command runs (Claude CLI style; patterns like `Bash(git:*)` are stripped to just the tool name)
 
 Rules:
 - Filenames beginning with `_` are drafts (skipped).
@@ -213,24 +214,85 @@ Rules:
 
 When no `CommandsDir` is configured, slash commands are disabled entirely. Typing `/anything` is then sent to the model as a literal user message.
 
+## MCP prompts (slash commands from the MCP server)
+
+MCP prompts merge into the same `/` namespace as file-based slash commands. The user invokes them identically — there's no separate `/prompt` prefix. File commands take precedence on name collision.
+
+### How it works
+
+When the user types `/explain concept=recursion level=simple`:
+
+1. The frontend checks file-based commands first — no match for `explain`
+2. Falls through to MCP prompts — finds `explain` with declared args `concept` (required) and `level` (optional)
+3. Parses arguments: `key=value` pairs, or positional shorthand for single-arg prompts (`/summarise some text` → `{text: "some text"}`)
+4. Calls `POST {prefix}/api/prompts/get` with the name and parsed args
+5. The host's `GetPrompt` renders the prompt and returns messages
+6. Those messages are injected into the conversation and a completion turn starts
+
+### Autocomplete
+
+Typing `/` shows a unified dropdown of file commands and MCP prompts. MCP prompts are marked with a purple bolt icon and show their argument names (e.g. `concept* level`) in the hint column. Arrow keys navigate, Enter/Tab selects.
+
+### Discovery
+
+- `/list-prompts` — renders an info card listing all available MCP prompts with their argument signatures
+- `/list-resources` — renders an info card listing all available MCP resources with their URIs
+
+### Prompt arguments
+
+Arguments are parsed from the text after the command name:
+
+```
+/explain concept=recursion level=advanced
+/summarise this is a long block of text that goes to the single "text" arg
+/review code="print('hello')"
+```
+
+If the prompt declares exactly one argument and the input has no `=` signs, the entire remainder is assigned to that argument positionally. Otherwise, `key=value` pairs are extracted.
+
+## MCP resources (attach context with @)
+
+MCP resources are data the user can attach to a message as context for the model. They appear as attachment chips (like email attachments) on the user's message bubble — the raw content is hidden from the transcript but sent to the model as prefixed context.
+
+### How it works
+
+1. User types `@` in the composer — a green dropdown shows matching resource URIs
+2. Selecting a resource reads it immediately via `POST {prefix}/api/resources/read`
+3. The content is added to a pending-attachments tray below the textarea (green chips with remove buttons)
+4. On send, each attachment's content is prepended to the user's message text:
+
+```
+Resource docs://readme.md:
+<full resource content here>
+
+<user's actual message text>
+```
+
+5. The model sees the full resource text; the transcript shows only the chip.
+
+### Resource templates
+
+Template resources (with `{var}` placeholders in the URI) appear in the dropdown marked as "template". The user types the variable part into the URI — e.g. selecting `greeting://{name}` and the frontend reads `greeting://Ada` (the `@` autocomplete matches on URI substring, so typing `@greet` or `@Ada` finds it).
+
+### Multiple attachments
+
+Multiple `@resource` selections can be attached to a single message. Each is rendered as a separate chip and its content is injected separately.
+
 ## Frontend
 
 The chat UI lives in [`web/`](web):
-- `web/templates/chat.html` — server-rendered HTML shell with an Alpine `x-data="webchat(...)"` root.
-- `web/src/chat.js` — Alpine data component. Listens for `alpine:init` and registers itself via `window.Alpine.data("webchat", ...)`. Conversations persist to `localStorage` under `webchat:conversations`.
-- `web/src/chat.css` — small stylesheet for scrollbar polish; Tailwind utilities handle almost everything else.
-
-The frontend **does not bundle its own Alpine or Tailwind**. It loads them from the host's already-bundled assets via `Config.HostJSFile` / `Config.HostCSSFile`. This keeps webchat free of CDN dependencies and version skew.
+- `web/src/chat.js` — Alpine data component (includes the markdown processor). Conversations persist to `sessionStorage`. The frontend **does not bundle its own Alpine or Tailwind** — it loads them from the host's bundled assets. This keeps webchat free of CDN dependencies and version skew.
+- `examples/chat.html` — reference template that hosts copy into their own template tree (where Tailwind can scan it during build).
 
 ### Script-order gotcha
 
-The host's bundle calls `Alpine.start()` synchronously at the bottom. `start()` immediately dispatches `alpine:init` — the only window in which `Alpine.data(...)` registrations are accepted. So `chat.js` must run BEFORE the host bundle. The shipped `chat.html` orders the two `<script defer>` tags accordingly; if you customise the template, preserve that order.
+The host's bundle calls `Alpine.start()` synchronously at the bottom. `start()` immediately dispatches `alpine:init` — the only window in which `Alpine.data(...)` registrations are accepted. So `chat.js` must run BEFORE the host bundle. The shipped example template orders the two `<script defer>` tags accordingly; if you customise the template, preserve that order.
 
 ## Auth
 
-Webchat takes an `AuthMiddleware func(http.Handler) http.Handler` in `Config` and wraps every handler with it. The host decides what auth means — session cookie, bearer token, mTLS, IP allow-list, anything. nil means no auth (rare; appropriate only for fully internal hosts).
+Auth is entirely the host's responsibility. webchat takes an `AuthMiddleware func(http.Handler) http.Handler` in `Config` and wraps every handler with it. The host decides what auth means — session cookie, bearer token, mTLS, IP allow-list, anything. nil means no auth (rare; appropriate only for fully internal hosts).
 
-The frontend sends cookies by default (same-origin fetch). For token-based hosts, add an `Authorization` header in a small wrapper around `fetch` inside `chat.js`.
+The host's template provides whatever login/logout UI it wants — webchat's JS has no knowledge of auth endpoints.
 
 ## Testing
 

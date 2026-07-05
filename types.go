@@ -26,12 +26,14 @@ const (
 	RoleTool       Role = "tool"
 )
 
-// Message is one turn in a conversation. Content is the visible text;
-// ToolCalls is set when Role == RoleAssistant and the model requested tools;
-// ToolCallID is set when Role == RoleTool (the result of a tool call).
+// Message is one turn in a conversation. Content is normally a string, but
+// when a message carries resource attachments the frontend may send it as
+// an OpenAI-compatible content array: [{type:"text",text:"..."},{type:"image_url",...}].
+// The Go type uses interface{} to accept both shapes and pass them through
+// to the host's Complete implementation verbatim.
 type Message struct {
 	Role       Role       `json:"role"`
-	Content    string     `json:"content,omitempty"`
+	Content    any        `json:"content,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	ToolName   string     `json:"tool_name,omitempty"`

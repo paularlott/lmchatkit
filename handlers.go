@@ -1,6 +1,8 @@
 package webchat
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 )
@@ -14,7 +16,7 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request) {
 			personas = got
 		}
 	}
-	writeJSON(w, http.StatusOK, personas)
+	writeJSONWithETag(w, r, personas)
 }
 
 // handleCommands returns the slash-command snapshot including the rendered
@@ -31,7 +33,7 @@ func (s *Server) handleCommands(w http.ResponseWriter, r *http.Request) {
 			cmds = got
 		}
 	}
-	writeJSON(w, http.StatusOK, cmds)
+	writeJSONWithETag(w, r, cmds)
 }
 
 // handleModels proxies the host's model list.
@@ -44,7 +46,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if models == nil {
 		models = []Model{}
 	}
-	writeJSON(w, http.StatusOK, models)
+	writeJSONWithETag(w, r, models)
 }
 
 // chatRequest is the body shape expected by POST /api/chat. Messages is the
@@ -80,7 +82,7 @@ func (s *Server) handleListTools(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(disabled) == 0 {
-		writeJSON(w, http.StatusOK, tools)
+		writeJSONWithETag(w, r, tools)
 		return
 	}
 	set := make(map[string]bool, len(disabled))
@@ -93,7 +95,7 @@ func (s *Server) handleListTools(w http.ResponseWriter, r *http.Request) {
 			out = append(out, t)
 		}
 	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSONWithETag(w, r, out)
 }
 
 // toolCallRequest is the body shape for /api/tools/call.
@@ -129,7 +131,7 @@ func (s *Server) handleListPrompts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, prompts)
+	writeJSONWithETag(w, r, prompts)
 }
 
 // promptGetRequest is the body shape for /api/prompts/get.
@@ -164,7 +166,7 @@ func (s *Server) handleListResources(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, resources)
+	writeJSONWithETag(w, r, resources)
 }
 
 // resourceReadRequest is the body shape for /api/resources/read.
@@ -236,6 +238,28 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeJSONWithETag marshals v to JSON, computes an ETag from the bytes,
+// and checks the If-None-Match request header. If the client already has
+// this version, returns 304 Not Modified with no body — saves bandwidth
+// and client-side parsing on the post-completion refresh calls.
+func writeJSONWithETag(w http.ResponseWriter, r *http.Request, v interface{}) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "marshal failed")
+		return
+	}
+	sum := sha256.Sum256(data)
+	etag := `"` + hex.EncodeToString(sum[:8]) + `"`
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("ETag", etag)
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
 }
 
 // writeError writes an error response in the conventional {error: ...} shape.
