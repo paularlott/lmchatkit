@@ -305,8 +305,12 @@ function webchat({ prefix }) {
 
     // AbortController for the in-flight /api/chat request. Nulled when the
     // turn finishes (cleanly, errored, or cancelled). The Cancel button is
-    // visible iff streaming is true.
+    // visible iff this is non-null AND streaming is true.
     abortController: null,
+
+    // Which message index was just copied to clipboard (-1 = none).
+    // Shows a checkmark on the copied message for 2 seconds.
+    copiedIdx: -1,
 
     // Input history (shell-style). inputHistory is shared across all chats
     // and persists to sessionStorage so the user keeps their command memory
@@ -1258,6 +1262,14 @@ function webchat({ prefix }) {
       if (!el) return;
       el.style.height = "auto";
       el.style.height = Math.min(el.scrollHeight, 160) + "px";
+    },
+
+    copyMessage(idx, content) {
+      if (!content) return;
+      navigator.clipboard.writeText(content).then(() => {
+        this.copiedIdx = idx;
+        setTimeout(() => { if (this.copiedIdx === idx) this.copiedIdx = -1; }, 2000);
+      }).catch(() => {});
     },
     toggleAllTools(ev) {
       if (ev.target.checked) {
