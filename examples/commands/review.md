@@ -1,6 +1,7 @@
 ---
 description: Review code and suggest improvements
 argument-hint: <paste-code-or-describe-changes>
+allowed-tools: search, execute_tool
 ---
 
 Review the following code or changes. Focus on:

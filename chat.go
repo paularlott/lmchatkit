@@ -68,49 +68,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		close(events)
 	}()
 
-	encoder := json.NewEncoder(sseWriter{w: w, flusher: flusher})
 	for ev := range events {
-		if err := encoder.Encode(ev); err != nil {
-			// Client gone or write error — give up.
-			return
-		}
-		// SSE framing: the JSON encoder writes compact JSON + newline; we
-		// prefix with "data: " and terminate with a blank line per spec.
-		// We achieve that by wrapping the writer (sseWriter) which adds the
-		// prefix and trailer automatically.
+		data, _ := json.Marshal(ev)
+		w.Write([]byte("data: "))
+		w.Write(data)
+		w.Write([]byte("\n\n"))
 		flusher.Flush()
 	}
 
 	if err := <-done; err != nil {
-		// Host reported a terminal error. Try to surface it to the client.
-		_ = encoder.Encode(Event{Type: EventError, Error: err.Error()})
+		data, _ := json.Marshal(Event{Type: EventError, Error: err.Error()})
+		w.Write([]byte("data: "))
+		w.Write(data)
+		w.Write([]byte("\n\n"))
 		flusher.Flush()
 	}
-}
-
-// sseWriter wraps an http.ResponseWriter so each Write call produces one
-// valid SSE data: line. Multiple writes for the same logical event aren't
-// supported — we always emit one event per encoder.Encode call.
-type sseWriter struct {
-	w       http.ResponseWriter
-	flusher http.Flusher
-}
-
-func (s sseWriter) Write(p []byte) (int, error) {
-	// Trim the trailing newline the JSON encoder adds so we can replace it
-	// with the SSE-compliant terminator.
-	payload := p
-	for len(payload) > 0 && payload[len(payload)-1] == '\n' {
-		payload = payload[:len(payload)-1]
-	}
-	n, err := s.w.Write([]byte("data: "))
-	if err != nil {
-		return n, err
-	}
-	m, err := s.w.Write(payload)
-	if err != nil {
-		return n + m, err
-	}
-	o, err := s.w.Write([]byte("\n\n"))
-	return n + m + o, err
 }

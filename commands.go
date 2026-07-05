@@ -30,6 +30,7 @@ type SlashCommand struct {
 	Name         string `json:"name"`                    // canonical name (filename stem), no leading slash
 	Description  string `json:"description,omitempty"`   // from frontmatter, shown in the selection menu
 	ArgumentHint string `json:"argument_hint,omitempty"` // from frontmatter, e.g. "<github-handle>"
+	AllowedTools string `json:"allowed_tools,omitempty"` // from frontmatter, comma-separated tool names to auto-allow
 	Body         string `json:"body"`                    // raw markdown (frontmatter stripped); $ARGUMENTS replaced when rendered
 	Source       string `json:"source"`                  // short source hint for debugging
 }
@@ -144,6 +145,7 @@ func (s *commandStore) reload() error {
 				Name:         stem,
 				Description:  meta["description"],
 				ArgumentHint: meta["argument-hint"],
+				AllowedTools: meta["allowed-tools"],
 				Body:         mdBody,
 				Source:       e.Name(),
 			})

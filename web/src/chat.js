@@ -279,14 +279,9 @@ if (window.Alpine && typeof window.Alpine.data === "function") {
   });
 }
 
-function webchat({ prefix, logoutUrl, loginUrl }) {
+function webchat({ prefix }) {
   return {
     prefix,
-    // Host-supplied auth paths. webchat doesn't know where the host's
-    // logout endpoint or login page live — these are passed from the
-    // template so nothing is hardcoded in the JS bundle.
-    _logoutUrl: logoutUrl || "",
-    _loginUrl: loginUrl || "",
     personas: [{ id: "default", name: "Default" }],
     models: [],
     commands: [],
@@ -323,10 +318,15 @@ function webchat({ prefix, logoutUrl, loginUrl }) {
     partialDraft: "",
 
     // Auto-scroll: while streaming we scroll the transcript to the bottom
-    // whenever new content arrives. If the user scrolls up (to read
-    // earlier output) we stop auto-scrolling so the bubble they're reading
-    // doesn't jump. Scrolling back to the bottom re-enables auto-scroll.
-    // Mirrors knot's handleScroll/scrollToBottom pair.
+    // whenever new content arrives. If the user scrolls up (mouse wheel,
+    // touch) we stop auto-scrolling so the content they're reading doesn't
+    // jump. Scrolling back to the bottom re-enables auto-scroll.
+    //
+    // We detect "user scrolled up" via wheel/touch events, NOT scroll
+    // events — scroll events fire for our own programmatic scrollTop
+    // assignments and the timing is racy (the browser fires them as async
+    // tasks, which can arrive after our _programmaticScroll flag was reset).
+    // Wheel and touchmove are 100% user-initiated — no false positives.
     userHasScrolled: false,
 
     // Setup modal state
@@ -350,10 +350,11 @@ function webchat({ prefix, logoutUrl, loginUrl }) {
       max_tokens: null,
     },
 
-    // "Always allow" set for current conversation (persists across turns).
-    // Per-call approval state lives on each tool_call object as
-    // call.approval ('pending' | 'approved' | 'denied' | etc) so the UI
-    // renders inline within the assistant bubble.
+    // "Always allow" set — session-global, shared across all chats in this
+    // browser tab. Stored in sessionStorage so it survives page refresh but
+    // clears when the browser closes. When the user clicks "Always Allow"
+    // for a tool, that tool is auto-approved in every chat for the rest of
+    // the session.
     autoAllowTools: [],
 
     init() {
@@ -395,6 +396,11 @@ function webchat({ prefix, logoutUrl, loginUrl }) {
       try {
         this.inputHistory = JSON.parse(sessionStorage.getItem("webchat:inputHistory") || "[]");
       } catch { this.inputHistory = []; }
+
+      // Restore session-global auto-allow set (shared across all chats).
+      try {
+        this.autoAllowTools = JSON.parse(sessionStorage.getItem("webchat:autoAllow") || "[]");
+      } catch { this.autoAllowTools = []; }
 
       // One-time cleanup: remove old localStorage entries left over from
       // before the switch to sessionStorage. Safe no-op once they're gone.
@@ -449,15 +455,6 @@ function webchat({ prefix, logoutUrl, loginUrl }) {
           }
         }
       } catch {}
-    },
-
-    // Logs the chat session out via the host's admin endpoint and bounces to
-    // the admin login page. Matches the rest of llmrouter's UI.
-    async logout() {
-      try {
-        if (this._logoutUrl) await fetch(this._logoutUrl, { method: "POST" });
-      } catch {}
-      if (this._loginUrl) window.location.href = this._loginUrl;
     },
 
     // -- persona helpers ---------------------------------------------------
@@ -593,8 +590,9 @@ function webchat({ prefix, logoutUrl, loginUrl }) {
     newChat() {
       this.currentId = null;
       this.messages = [];
-      this.autoAllowTools = [];
-      sessionStorage.removeItem("webchat:currentId");
+      localStorage.removeItem("webchat:currentId");
+      // Note: autoAllowTools is NOT reset — "Always Allow" is
+      // session-global, not per-chat.
     },
 
     startChat() {
@@ -607,7 +605,6 @@ function webchat({ prefix, logoutUrl, loginUrl }) {
         model: this.setupModel,
         params: this.setupEffectiveParams,
         messages: [],
-        autoAllow: [],
         enabledTools: this.allTools.map((t) => t.name),
         createdAt: Date.now(),
       };
@@ -619,7 +616,6 @@ function webchat({ prefix, logoutUrl, loginUrl }) {
       this.currentId = id;
       sessionStorage.setItem("webchat:currentId", id);
       this.messages = conv.messages;
-      this.autoAllowTools = conv.autoAllow;
       this.enabledTools = conv.enabledTools;
       this.writeStorage();
       this.$nextTick(() => this.$refs.composer && this.$refs.composer.focus());
@@ -631,7 +627,6 @@ function webchat({ prefix, logoutUrl, loginUrl }) {
       this.currentId = id;
       sessionStorage.setItem("webchat:currentId", id);
       this.messages = c.messages;
-      this.autoAllowTools = c.autoAllow || [];
       this.enabledTools = c.enabledTools || this.allTools.map((t) => t.name);
       // Loading an existing conversation: park at the bottom and refocus so
       // the user can immediately continue typing.
@@ -653,7 +648,6 @@ function webchat({ prefix, logoutUrl, loginUrl }) {
       const c = this.current();
       if (c) {
         c.messages = this.messages;
-        c.autoAllow = this.autoAllowTools;
         c.enabledTools = this.enabledTools;
         this.writeStorage();
       }
@@ -784,6 +778,7 @@ function webchat({ prefix, logoutUrl, loginUrl }) {
       if (c && c.title === "New conversation") {
         c.title = draft.slice(0, 50);
       }
+      this.scrollToBottom();
       this.persist();
       await this.streamTurn();
     },
@@ -821,6 +816,10 @@ function webchat({ prefix, logoutUrl, loginUrl }) {
         showThinking: false,
         tool_calls: [],
       });
+      // Scroll immediately so the bouncing dots (inside the empty bubble)
+      // are visible while the model loads — not just when the first delta
+      // arrives (which can take 10+ seconds on slow providers).
+      this.scrollToBottom();
       const reactiveAssistant = this.messages[this.messages.length - 1];
       // Per-turn state for <think>-tag buffering (some open-source models
       // embed reasoning inline in content rather than via reasoning_content).
@@ -1042,6 +1041,7 @@ function webchat({ prefix, logoutUrl, loginUrl }) {
       if (call.approval !== "pending") return;
       if (always && !this.autoAllowTools.includes(call.name)) {
         this.autoAllowTools.push(call.name);
+        sessionStorage.setItem("webchat:autoAllow", JSON.stringify(this.autoAllowTools));
       }
       call.approval = "approving";
       await this.executeToolCall(call);
@@ -1178,8 +1178,23 @@ function webchat({ prefix, logoutUrl, loginUrl }) {
       const args = sp === -1 ? "" : trimmed.slice(sp + 1).trim();
       const cmd = (this.commands || []).find((c) => c.name === name);
       if (!cmd) return false;
+      // If the command declares allowed-tools in frontmatter, add them
+      // to the session-global auto-allow set so the model can call them
+      // without prompting. Format: comma-separated tool names, optionally
+      // with Claude-style patterns like Bash(git:*) — we strip the pattern
+      // for now and match on tool name only.
+      if (cmd.allowed_tools) {
+        for (const raw of cmd.allowed_tools.split(",")) {
+          const toolName = raw.trim().split("(")[0].trim();
+          if (toolName && !this.autoAllowTools.includes(toolName)) {
+            this.autoAllowTools.push(toolName);
+          }
+        }
+        sessionStorage.setItem("webchat:autoAllow", JSON.stringify(this.autoAllowTools));
+      }
       const rendered = (cmd.body || "").replaceAll("$ARGUMENTS", args);
       this.messages.push({ role: "user", content: rendered });
+      this.scrollToBottom();
       this.persist();
       await this.streamTurn();
       return true;
@@ -1209,13 +1224,22 @@ function webchat({ prefix, logoutUrl, loginUrl }) {
       });
     },
 
-    // onMessagesScroll toggles userHasScrolled based on whether the user is
-    // parked at the bottom of the transcript. Threshold is 50px so minor
-    // rendering jitter doesn't trip the "scrolled up" state.
-    onMessagesScroll(event) {
-      const el = event.target;
-      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
-      this.userHasScrolled = !atBottom;
+    // onWheel detects the user scrolling UP (deltaY < 0) and disables
+    // auto-scroll. Scrolling DOWN re-enables it when they reach the bottom.
+    // This replaces the old onMessagesScroll approach which was racy —
+    // scroll events from our own scrollTop assignments could arrive after
+    // the _programmaticScroll flag was reset, causing false "user scrolled
+    // up" detections that killed auto-scroll mid-stream.
+    onWheel(e) {
+      if (e.deltaY < 0) {
+        this.userHasScrolled = true;
+      } else {
+        const el = this.$refs.messages;
+        if (el) {
+          const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+          if (atBottom) this.userHasScrolled = false;
+        }
+      }
     },
 
     // focusComposer puts keyboard focus back on the textarea. Called at the

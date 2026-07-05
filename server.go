@@ -2,6 +2,7 @@ package webchat
 
 import (
 	"context"
+	"embed"
 	"io"
 	"net/http"
 )
@@ -169,3 +170,11 @@ func withUser(r *http.Request, user any) *http.Request {
 func userFrom(r *http.Request) any {
 	return r.Context().Value(hostCtxKey{})
 }
+
+//go:embed web/src/chat.js
+var assetsFS embed.FS
+
+// AssetFS exposes the bundled chat.js so hosts can serve it from their
+// own asset pipeline if they prefer. [Server.Mount] already wires it up
+// at {prefix}/assets/chat.js.
+var AssetFS = assetsFS
