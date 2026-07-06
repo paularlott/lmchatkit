@@ -56,6 +56,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Messages = cleaned
 
+	// Dynamically augment the system prompt if the host supports it.
+	// Called on every request so dynamic content (like available skills)
+	// stays current without persisting to conversation history.
+	if a, ok := s.host.(SystemPromptAugmenter); ok {
+		for i := range req.Messages {
+			if req.Messages[i].Role == RoleSystem {
+				current, _ := req.Messages[i].Content.(string)
+				req.Messages[i].Content = a.AugmentSystemPrompt(r.Context(), current)
+				break // only augment the first system message
+			}
+		}
+	}
+
 	// Resolve @resource URIs and /prompt slash commands in user messages
 	// server-side. The browser sends raw text; the server resolves
 	// everything before forwarding to the host.

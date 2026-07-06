@@ -252,13 +252,30 @@ type StandardHost struct {
 	// request.
 	MCPServer func(ctx context.Context) *mcplib.Server
 
+	// SystemPromptAugmenter is called on every /api/chat request with the
+	// current system prompt (from the persona). The returned string
+	// replaces the system prompt sent to the LLM — the stored conversation
+	// is not modified. Use this to inject dynamic context like available
+	// skills. Optional: nil = pass through unchanged.
+	SystemPromptAugmenter func(ctx context.Context, current string) string
+
 	// HTTPClient overrides the default client. nil = use http.DefaultClient
 	// with no timeout (streaming needs no overall timeout).
 	HTTPClient *http.Client
 }
 
-// Compile-time check.
+// Compile-time checks.
 var _ Host = (*StandardHost)(nil)
+var _ SystemPromptAugmenter = (*StandardHost)(nil)
+
+// AugmentSystemPrompt satisfies SystemPromptAugmenter. If the function field
+// is nil, the prompt passes through unchanged.
+func (h *StandardHost) AugmentSystemPrompt(ctx context.Context, current string) string {
+	if h.SystemPromptAugmenter != nil {
+		return h.SystemPromptAugmenter(ctx, current)
+	}
+	return current
+}
 
 func (h *StandardHost) Models(ctx context.Context) ([]Model, error) {
 	return h.ModelsFunc(ctx)

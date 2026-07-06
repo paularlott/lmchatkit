@@ -326,6 +326,10 @@ function webchat({ prefix }) {
     // Shows a checkmark on the copied message for 2 seconds.
     copiedIdx: -1,
 
+    // Delete confirmation modal state.
+    showDeleteChatModal: false,
+    deleteChatTarget: null,
+
     // Inline rename state for the sidebar. renamingId is the conversation
     // being edited; renameDraft holds the current text. When non-null,
     // that conversation item renders an <input> instead of a <button>.
@@ -460,6 +464,17 @@ function webchat({ prefix }) {
       }
     },
 
+    // hasPendingToolApprovals returns true if any assistant message has
+    // tool calls awaiting user action. Used to suppress SSE-triggered
+    // reloads that would clobber browser-only approval state.
+    hasPendingToolApprovals() {
+      return this.messages.some((m) =>
+        m.tool_calls && m.tool_calls.some((c) =>
+          c.approval === "pending" || c.approval === "approving" || c.approval === "denying"
+        )
+      );
+    },
+
     subscribeToEvents() {
       const es = new EventSource(`${this.prefix}/api/events`);
       es.onmessage = (e) => {
@@ -477,8 +492,11 @@ function webchat({ prefix }) {
                 // Another tab updated the conversation we're currently
                 // viewing. Reload the messages so new content appears
                 // live — but NOT if we're mid-stream (would clobber the
-                // in-progress assistant bubble).
-                if (!this.streaming) {
+                // in-progress assistant bubble) or if there are pending
+                // tool call approvals (the server data doesn't carry
+                // browser-only approval state, so reloading would
+                // silently drop the approval UI and deadlock the chat).
+                if (!this.streaming && !this.hasPendingToolApprovals()) {
                   this.reloadCurrentConversation();
                 }
                 // Refresh sidebar for updated title/timestamp.
@@ -566,7 +584,44 @@ function webchat({ prefix }) {
         if (this.messages.length !== prevLen) return;
         const data = await r.json();
         if (this.messages.length !== prevLen) return;
+
+        // Preserve browser-only tool call state (result, approval,
+        // executed, isError, auto) that the server doesn't persist.
+        // Without this, an SSE-triggered reload after a deny/execute
+        // would wipe the result from the UI.
+        const prevTCState = new Map();
+        for (const m of this.messages) {
+          if (m.role === "assistant" && m.tool_calls) {
+            for (const tc of m.tool_calls) {
+              prevTCState.set(tc.id, {
+                result: tc.result,
+                approval: tc.approval,
+                executed: tc.executed,
+                isError: tc.isError,
+                auto: tc.auto,
+              });
+            }
+          }
+        }
+
         this.messages = this.normalizeMessages(data.messages);
+
+        // Merge back browser-only state onto the reloaded tool calls.
+        for (const m of this.messages) {
+          if (m.role === "assistant" && m.tool_calls) {
+            for (const tc of m.tool_calls) {
+              const prev = prevTCState.get(tc.id);
+              if (prev) {
+                tc.result = prev.result;
+                tc.approval = prev.approval;
+                tc.executed = prev.executed;
+                tc.isError = prev.isError;
+                tc.auto = prev.auto;
+              }
+            }
+          }
+        }
+
         this.scrollToBottom();
       } catch {}
     },
@@ -870,11 +925,20 @@ function webchat({ prefix }) {
       this.deleteConversation(this.currentId);
     },
 
-    // deleteConversation removes a conversation by ID (not just the
-    // current one). Used by the sidebar per-item delete button. Clears
-    // currentId/messages if we're deleting the active conversation.
+    // deleteConversation opens the confirmation modal. The actual delete
+    // happens in confirmDeleteChat when the user clicks Delete.
     deleteConversation(id) {
       if (!id) return;
+      this.deleteChatTarget = id;
+      this.showDeleteChatModal = true;
+    },
+
+    // confirmDeleteChat performs the deletion after the user confirms.
+    confirmDeleteChat() {
+      const id = this.deleteChatTarget;
+      if (!id) return;
+      this.showDeleteChatModal = false;
+      this.deleteChatTarget = null;
       if (this._serverMode) {
         fetch(`${this.prefix}/api/conversations/${id}`, { method: "DELETE" }).catch(() => {});
       } else {
@@ -1543,13 +1607,16 @@ function webchat({ prefix }) {
     async denyToolCall(call) {
       if (call.approval !== "pending") return;
       call.approval = "denying";
-      call.result = "[denied by user]";
-      // Append a tool message so the model knows the user declined.
+      call.result = "Denied by user";
+      // The tool message content is what the model sees. Be explicit so
+      // the LLM understands this is a hard "no" and doesn't retry.
+      const denyMsg = "The user denied this tool call. Do not attempt to call '" + call.name + "' again. " +
+        "Ask the user how they would like to proceed, or continue with an alternative approach.";
       this.messages.push({
         id: "msg-" + (++_msgSeq), role: "tool",
         tool_call_id: call.id,
         tool_name: call.name,
-        content: "[denied by user]",
+        content: denyMsg,
       });
       call.approval = "denied";
       this.persist();

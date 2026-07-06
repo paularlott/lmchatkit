@@ -232,6 +232,17 @@ type PersonaSource interface {
 	Personas(ctx context.Context) ([]Persona, error)
 }
 
+// SystemPromptAugmenter is an optional interface a Host can implement to
+// dynamically augment the system prompt on every chat request. The chat
+// handler calls AugmentSystemPrompt with the current system prompt content
+// (from the persona) and uses the returned string when forwarding to the
+// LLM. The stored conversation is not modified — the augmentation is
+// transient, recomputed on each request so it always reflects current state
+// (e.g. skills added/removed at runtime).
+type SystemPromptAugmenter interface {
+	AugmentSystemPrompt(ctx context.Context, current string) string
+}
+
 // CommandSource is the backend behind /api/commands. Same contract as
 // [PersonaSource]: a file-watching default exists, hosts with a database
 // (e.g. per-user commands in knot) implement their own.
