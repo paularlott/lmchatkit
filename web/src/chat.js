@@ -326,6 +326,12 @@ function webchat({ prefix }) {
     // Shows a checkmark on the copied message for 2 seconds.
     copiedIdx: -1,
 
+    // Inline rename state for the sidebar. renamingId is the conversation
+    // being edited; renameDraft holds the current text. When non-null,
+    // that conversation item renders an <input> instead of a <button>.
+    renamingId: null,
+    renameDraft: "",
+
     // Server-side history mode. Detected on init by probing
     // GET /api/conversations. When true, conversations are loaded/saved
     // via the server API and SSE events keep multiple tabs in sync.
@@ -492,6 +498,12 @@ function webchat({ prefix }) {
               if (event.id === this.currentId) {
                 this.newChat();
               }
+              break;
+            case "conversation_renamed":
+              // Another tab renamed a conversation. Refresh the sidebar
+              // to show the new title. No unread marking — a title change
+              // is not new content.
+              this.loadConversationList();
               break;
             case "tools_changed":   this.loadTools(); break;
             case "prompts_changed": this.loadPrompts(); break;
@@ -855,16 +867,44 @@ function webchat({ prefix }) {
 
     deleteCurrent() {
       if (!this.currentId) return;
-      const id = this.currentId;
+      this.deleteConversation(this.currentId);
+    },
+
+    // deleteConversation removes a conversation by ID (not just the
+    // current one). Used by the sidebar per-item delete button. Clears
+    // currentId/messages if we're deleting the active conversation.
+    deleteConversation(id) {
+      if (!id) return;
       if (this._serverMode) {
         fetch(`${this.prefix}/api/conversations/${id}`, { method: "DELETE" }).catch(() => {});
       } else {
         this.conversations = this.conversations.filter((c) => c.id !== id);
         this.writeStorage();
       }
-      this.currentId = null;
-      sessionStorage.removeItem("webchat:currentId");
-      this.messages = [];
+      if (id === this.currentId) {
+        this.currentId = null;
+        sessionStorage.removeItem("webchat:currentId");
+        this.messages = [];
+      }
+    },
+
+    // renameConversation sends a title-only PATCH to the server and
+    // updates the local sidebar immediately. The server broadcasts a
+    // conversation_renamed SSE so other tabs pick up the new title.
+    renameConversation(id, title) {
+      title = (title || "").trim();
+      if (!title) return;
+      const conv = this.conversations.find((c) => c.id === id);
+      if (conv) conv.title = title;
+      if (this._serverMode) {
+        fetch(`${this.prefix}/api/conversations/${id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title }),
+        }).catch(() => {});
+      } else {
+        this.writeStorage();
+      }
     },
 
     persist() {
@@ -1018,7 +1058,7 @@ function webchat({ prefix }) {
       this.userHasScrolled = false;
       this.recordInputHistory(draft);
 
-      // Built-in meta commands (don't go to the model)
+      // Built-in meta commands (don't go to the model directly)
       if (draft === "/list-prompts") {
         this.draft = "";
         this.renderInfoCard("prompts", "Available MCP Prompts",
@@ -1036,6 +1076,11 @@ function webchat({ prefix }) {
             description: r.name || "",
             args: r.template ? "(template)" : "",
           })));
+        return;
+      }
+      if (draft === "/compact") {
+        this.draft = "";
+        await this.compactConversation();
         return;
       }
 
@@ -1302,6 +1347,152 @@ function webchat({ prefix }) {
       }
     },
 
+    // compactConversation sends the entire conversation to the LLM with a
+    // summarization prompt, then replaces the message history with the
+    // resulting summary. This reduces context window usage for long
+    // conversations while preserving important details.
+    //
+    // The compacted result keeps:
+    //   1. The original persona system prompt (so the model keeps its role)
+    //   2. A new system message with the summary (hidden from the UI via
+    //      role:"system" — the template skips system messages)
+    //   3. An info card showing what was compacted (visible to the user)
+    async compactConversation() {
+      if (this.streaming) return;
+      const conversational = this.messages.filter((m) => m.role !== "system" && !m.info);
+      if (conversational.length < 2) {
+        this.renderInfoCard("info", "Nothing to Compact",
+          [{ name: "Need at least 2 messages", description: "Compaction is useful for longer conversations." }]);
+        return;
+      }
+
+      // Preserve the original persona system prompt (first system message).
+      const systemMsgs = this.messages.filter((m) => m.role === "system");
+      const originalSystem = systemMsgs.length > 0 ? systemMsgs[0] : null;
+
+      // Pack the entire conversation into a single user message so the
+      // model treats this as a summarization task, NOT a live conversation
+      // to continue. Passing messages as separate user/assistant turns
+      // causes the model to respond to the last message rather than
+      // summarize — and it can run for thousands of tokens.
+      const extractText = (content) => {
+        if (typeof content === "string") return content;
+        if (Array.isArray(content)) return content.map((b) => b.text || "").join("");
+        return "";
+      };
+      const transcript = conversational.map((m) => {
+        const label = m.role === "user" ? "User" : "Assistant";
+        return `[${label}]: ${extractText(m.content)}`;
+      }).join("\n\n");
+
+      const compactPrompt =
+        "Summarize the following conversation concisely (200-500 words). " +
+        "Preserve key decisions, code snippets, file paths, URLs, and unresolved " +
+        "questions. Omit pleasantries and small talk. The summary must be " +
+        "detailed enough to continue the conversation seamlessly.";
+
+      const compactMessages = [
+        { role: "system", content: compactPrompt },
+        { role: "user", content: transcript },
+      ];
+
+      // Push an empty assistant bubble so the loading dots have somewhere
+      // to render. This bubble is replaced when compaction completes.
+      this.messages.push({
+        id: "msg-" + (++_msgSeq), role: "assistant",
+        content: "", thinking: "", tool_calls: [],
+      });
+      const compactingBubble = this.messages[this.messages.length - 1];
+
+      this.streaming = true;
+      this.abortController = new AbortController();
+      this.userHasScrolled = false;
+      this.scrollToBottom();
+
+      try {
+        const r = await fetch(`${this.prefix}/api/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: this.currentModel,
+            messages: compactMessages,
+            tools: [],
+            params: this.current()?.params || {},
+          }),
+          signal: this.abortController.signal,
+        });
+
+        if (!r.ok) {
+          // Remove the temporary bubble before showing the error card.
+          const idx = this.messages.indexOf(compactingBubble);
+          if (idx >= 0) this.messages.splice(idx, 1);
+          const err = await r.json().catch(() => ({ error: "compaction failed" }));
+          this.renderInfoCard("error", "Compaction Failed",
+            [{ name: err.error || "Unknown error", description: "" }]);
+          return;
+        }
+
+        let summary = "";
+        await this.readSSE(r, (ev) => {
+          if (ev.type === "delta") {
+            summary += ev.delta;
+          } else if (ev.type === "error") {
+            summary = "";
+          }
+        });
+
+        if (!summary.trim()) {
+          const idx = this.messages.indexOf(compactingBubble);
+          if (idx >= 0) this.messages.splice(idx, 1);
+          this.renderInfoCard("error", "Compaction Failed",
+            [{ name: "Empty summary returned", description: "" }]);
+          return;
+        }
+
+        const oldCount = this.messages.length - 1; // exclude the temp bubble
+
+        // Build the compacted message list: original system prompt + summary.
+        // The summary is stored as an assistant message so:
+        //   - The model sees it as context for continuing the conversation
+        //   - The user can read it (rendered as markdown in the UI)
+        //   - It's transparent — the user knows exactly what the model sees
+        const newMessages = [];
+        if (originalSystem) {
+          newMessages.push({
+            id: "msg-" + (++_msgSeq),
+            role: "system",
+            content: originalSystem.content,
+          });
+        }
+        newMessages.push({
+          id: "msg-" + (++_msgSeq),
+          role: "assistant",
+          content: summary,
+          thinking: "",
+          tool_calls: [],
+        });
+
+        this.messages = newMessages;
+        // The info card tells the user what happened — the assistant
+        // message itself is just the raw summary so the model sees clean
+        // context, not meta-commentary about compaction.
+        this.renderInfoCard("compact", "Conversation Compacted",
+          [{ name: oldCount + " messages \u2192 summary", description: "Context reduced. The model retains the key details above." }]);
+      } catch (e) {
+        // Clean up the temporary bubble on any error.
+        const idx = this.messages.indexOf(compactingBubble);
+        if (idx >= 0) this.messages.splice(idx, 1);
+        if (e && e.name === "AbortError") return;
+        this.renderInfoCard("error", "Compaction Failed",
+          [{ name: (e && e.message) || "Unknown error", description: "" }]);
+      } finally {
+        this.streaming = false;
+        this.abortController = null;
+        this.persist();
+        this.focusComposer();
+      }
+    },
+
     // cancelStream aborts the in-flight chat request. The fetch's promise
     // rejects with an AbortError which streamTurn catches and treats as a
     // non-error — partial content already streamed stays in place.
@@ -1446,6 +1637,7 @@ function webchat({ prefix }) {
       if (!this.draft.startsWith("/")) return [];
       const name = this.draft.slice(1).split(/\s/)[0].toLowerCase();
       const builtins = [
+        { id: "_compact", name: "compact", description: "Summarize conversation history to save context", _builtin: true },
         { id: "_list-prompts", name: "list-prompts", description: "List available MCP prompts", _builtin: true },
         { id: "_list-resources", name: "list-resources", description: "List available MCP resources", _builtin: true },
       ];
