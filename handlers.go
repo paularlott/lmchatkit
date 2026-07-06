@@ -164,8 +164,10 @@ func (s *Server) handleReadResource(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAsset serves a file from the embedded JS/CSS bundle. The bundle is
-// tiny (no minification, no chunking) so a simple lookup is enough; we set
-// long-lived cache headers because the assets change only on binary upgrade.
+// tiny (no minification, no chunking). Assets are served at a stable URL with
+// a content-hash ETag and must-revalidate caching, so the browser rechecks
+// every load: an instant 304 when the asset is unchanged, or the new bytes
+// the moment the binary is upgraded (no 24h-stale window).
 func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 	rel := r.URL.Path[len(s.cfg.Prefix)+len("/assets/"):]
 	if rel == "" {
@@ -185,7 +187,14 @@ func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.Header().Set("Content-Type", "application/octet-stream")
 	}
-	w.Header().Set("Cache-Control", "public, max-age=86400")
+	sum := sha256.Sum256(data)
+	etag := `"` + hex.EncodeToString(sum[:8]) + `"`
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "public, max-age=0, must-revalidate")
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
 }

@@ -279,6 +279,49 @@ func TestAssetHandlerServesJS(t *testing.T) {
 	}
 }
 
+func TestAssetHandlerETagRevalidation(t *testing.T) {
+	s := newTestServer(t, &fakeHost{})
+
+	// First fetch: 200 with a content-hash ETag and a revalidate cache policy.
+	req := httptest.NewRequest(http.MethodGet, "/chat/assets/chat.js", nil)
+	rec := httptest.NewRecorder()
+	s.handleAsset(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first fetch status %d", rec.Code)
+	}
+	etag := rec.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("missing ETag on first fetch")
+	}
+	if cc := rec.Header().Get("Cache-Control"); !strings.Contains(cc, "must-revalidate") {
+		t.Fatalf("Cache-Control %q does not force revalidation", cc)
+	}
+
+	// Matching If-None-Match → 304 with no body.
+	req2 := httptest.NewRequest(http.MethodGet, "/chat/assets/chat.js", nil)
+	req2.Header.Set("If-None-Match", etag)
+	rec2 := httptest.NewRecorder()
+	s.handleAsset(rec2, req2)
+	if rec2.Code != http.StatusNotModified {
+		t.Fatalf("revalidation status %d, want 304", rec2.Code)
+	}
+	if rec2.Body.Len() != 0 {
+		t.Fatalf("304 should have no body, got %d bytes", rec2.Body.Len())
+	}
+
+	// Mismatched ETag → 200 with the body again (the upgrade case).
+	req3 := httptest.NewRequest(http.MethodGet, "/chat/assets/chat.js", nil)
+	req3.Header.Set("If-None-Match", `"deadbeef"`)
+	rec3 := httptest.NewRecorder()
+	s.handleAsset(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("mismatched-etag status %d, want 200", rec3.Code)
+	}
+	if rec3.Body.Len() == 0 {
+		t.Fatal("expected body on etag mismatch")
+	}
+}
+
 // min is a tiny helper for the substring test (Go 1.21+ has builtin min, but
 // we keep this for clarity when slicing).
 func min(a, b int) int {
