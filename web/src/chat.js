@@ -326,6 +326,14 @@ function webchat({ prefix }) {
     // Shows a checkmark on the copied message for 2 seconds.
     copiedIdx: -1,
 
+    // Server-side history mode. Detected on init by probing
+    // GET /api/conversations. When true, conversations are loaded/saved
+    // via the server API and SSE events keep multiple tabs in sync.
+    // When false, sessionStorage is used (current behaviour).
+    _serverMode: false,
+    _lastSavedId: null,
+    _lastSavedAt: 0,
+
     // Input history (shell-style). inputHistory is shared across all chats
     // and persists to sessionStorage so the user keeps their command memory
     // across browser restarts. historyIndex === -1 means "not browsing";
@@ -377,18 +385,19 @@ function webchat({ prefix }) {
     autoAllowTools: [],
 
     init() {
-      Promise.all([
-        this.loadPersonas(),
-        this.loadModels(),
-        this.loadCommands(),
-        this.loadTools(),
-        this.loadPrompts(),
-        this.loadResources(),
-      ]).then(() => {
-        // Auto-start: if the host only offers one persona and one model
-        // (e.g. knot's single-tenant system-defined setup), skip the picker
-        // and drop the user straight into a chat. They can still hit "New
-        // Chat" to come back to the picker if they want.
+      // Detect server-side history mode first — determines whether
+      // conversations live on the server (persistent, cross-tab) or in
+      // sessionStorage (ephemeral, per-tab).
+      this.detectServerMode().then(() => {
+        return Promise.all([
+          this.loadPersonas(),
+          this.loadModels(),
+          this.loadCommands(),
+          this.loadTools(),
+          this.loadPrompts(),
+          this.loadResources(),
+        ]);
+      }).then(() => {
         if (this.personas.length === 1 && this.models.length === 1 && this.conversations.length === 0) {
           this.selectSetupPersona(this.personas[0]);
           this.setupModel = this.models[0].id;
@@ -396,47 +405,158 @@ function webchat({ prefix }) {
         }
       }).catch((e) => console.warn("webchat init failed", e));
 
-      // Auto-grow the textarea on input, plus toggle slash autocomplete.
       this.$watch("draft", () => {
         this.autosize();
-        // Slash command autocomplete
         const matches = this.slashMatches;
         this.slashOpen = matches.length > 0 && !this.draft.includes(" ");
         if (this.slashIndex >= matches.length) this.slashIndex = Math.max(0, matches.length - 1);
-        // /prompt autocomplete: after "/prompt " show prompt names
         const pm = this.promptMenuMatches;
         this.promptMenuOpen = pm.length > 0;
         if (this.promptMenuIndex >= pm.length) this.promptMenuIndex = 0;
-        // @resource autocomplete: when draft ends with @<partial>
         const rm = this.resourceMenuMatches;
         this.resourceMenuOpen = rm.length > 0;
         if (this.resourceMenuIndex >= rm.length) this.resourceMenuIndex = 0;
       });
 
-      // Restore saved conversations + the chat that was last open so a
-      // page refresh picks up where the user left off rather than
-      // starting a new chat.
+      try {
+        this.inputHistory = JSON.parse(sessionStorage.getItem("webchat:inputHistory") || "[]");
+      } catch { this.inputHistory = []; }
+
+      try {
+        this.autoAllowTools = JSON.parse(sessionStorage.getItem("webchat:autoAllow") || "[]");
+      } catch { this.autoAllowTools = []; }
+
+      ["webchat:conversations", "webchat:currentId", "webchat:inputHistory"].forEach((k) => {
+        try { localStorage.removeItem(k); } catch {}
+      });
+    },
+
+    async detectServerMode() {
+      try {
+        const r = await fetch(`${this.prefix}/api/conversations`);
+        if (r.ok) {
+          this._serverMode = true;
+          const list = await r.json();
+          this.conversations = Array.isArray(list) ? list : [];
+          this.subscribeToEvents();
+          const savedId = sessionStorage.getItem("webchat:currentId") || "";
+          if (savedId && this.conversations.some((c) => c.id === savedId)) {
+            await this.loadConversation(savedId);
+          }
+          return;
+        }
+      } catch {}
+      this._serverMode = false;
       this.conversations = this.readStorage();
       const savedId = sessionStorage.getItem("webchat:currentId") || "";
       if (savedId && this.conversations.some((c) => c.id === savedId)) {
         this.loadConversation(savedId);
       }
+    },
 
-      // Restore shared input history (across all chats, within this session).
+    subscribeToEvents() {
+      const es = new EventSource(`${this.prefix}/api/events`);
+      es.onmessage = (e) => {
+        try {
+          const event = JSON.parse(e.data);
+          switch (event.type) {
+            case "conversation_saved":
+              // Skip our own saves — we already have the data locally.
+              if (event.id === this.currentId && this._lastSavedId === event.id && Date.now() - this._lastSavedAt < 2000) {
+                this._lastSavedId = null;
+                break;
+              }
+
+              if (event.id === this.currentId) {
+                // Another tab updated the conversation we're currently
+                // viewing. Reload the messages so new content appears
+                // live — but NOT if we're mid-stream (would clobber the
+                // in-progress assistant bubble).
+                if (!this.streaming) {
+                  this.reloadCurrentConversation();
+                }
+                // Refresh sidebar for updated title/timestamp.
+                this.loadConversationList();
+              } else {
+                // A different conversation was updated. Refresh the
+                // sidebar and mark it unread so the user knows to
+                // check it.
+                this.loadConversationList().then(() => {
+                  const conv = this.conversations.find((c) => c.id === event.id);
+                  if (conv) conv.unread = true;
+                });
+              }
+              break;
+            case "conversation_deleted":
+              this.loadConversationList();
+              if (event.id === this.currentId) {
+                this.newChat();
+              }
+              break;
+            case "tools_changed":   this.loadTools(); break;
+            case "prompts_changed": this.loadPrompts(); break;
+            case "resources_changed": this.loadResources(); break;
+          }
+        } catch {}
+      };
+    },
+
+    async loadConversationList() {
       try {
-        this.inputHistory = JSON.parse(sessionStorage.getItem("webchat:inputHistory") || "[]");
-      } catch { this.inputHistory = []; }
+        const r = await fetch(`${this.prefix}/api/conversations`);
+        if (r.ok) {
+          const list = await r.json();
+          if (Array.isArray(list)) {
+            // Preserve unread flags from existing conversations so they
+            // survive list refreshes. Without this, every call to
+            // loadConversationList would wipe all unread indicators.
+            const prevUnread = new Set(
+              this.conversations.filter((c) => c.unread).map((c) => c.id)
+            );
+            this.conversations = list.map((c) => ({
+              ...c,
+              unread: prevUnread.has(c.id),
+            }));
+          }
+        }
+      } catch {}
+    },
 
-      // Restore session-global auto-allow set (shared across all chats).
+    // normalizeMessages ensures every message loaded from the server has
+    // the fields the UI needs: a unique id (Alpine x-for :key — without it
+    // duplicate undefined keys cause only the last message to render) and
+    // a tool_calls array (so .push/.filter don't crash on undefined).
+    normalizeMessages(msgs) {
+      return (msgs || []).map((m) => ({
+        ...m,
+        id: m.id || ("msg-" + (++_msgSeq)),
+        tool_calls: m.tool_calls || [],
+      }));
+    },
+
+    // reloadCurrentConversation fetches the conversation we're currently
+    // viewing and replaces messages in-place. Used when another tab saves
+    // the same conversation — the new content appears live. Unlike
+    // loadConversation, this does NOT reset currentId, sessionStorage,
+    // enabledTools, or steal focus — those are already correct. It also
+    // does NOT force userHasScrolled=false, so if the user scrolled up
+    // to read, they stay where they are.
+    //
+    // Race guard: if the user sends a message while the fetch is in
+    // flight (changing this.messages.length), the reload is aborted so
+    // we don't clobber their just-pushed message.
+    async reloadCurrentConversation() {
+      if (!this.currentId) return;
+      const prevLen = this.messages.length;
       try {
-        this.autoAllowTools = JSON.parse(sessionStorage.getItem("webchat:autoAllow") || "[]");
-      } catch { this.autoAllowTools = []; }
-
-      // One-time cleanup: remove old localStorage entries left over from
-      // before the switch to sessionStorage. Safe no-op once they're gone.
-      ["webchat:conversations", "webchat:currentId", "webchat:inputHistory"].forEach((k) => {
-        try { localStorage.removeItem(k); } catch {}
-      });
+        const r = await fetch(`${this.prefix}/api/conversations/${this.currentId}`);
+        if (!r.ok) return;
+        if (this.messages.length !== prevLen) return;
+        const data = await r.json();
+        if (this.messages.length !== prevLen) return;
+        this.messages = this.normalizeMessages(data.messages);
+        this.scrollToBottom();
+      } catch {}
     },
 
     // -- loaders -----------------------------------------------------------
@@ -538,7 +658,7 @@ function webchat({ prefix }) {
     get currentPersonaName() {
       const c = this.current();
       if (!c) return "";
-      const p = this.personas.find((x) => x.id === c.personaId);
+      const p = this.personas.find((x) => x.id === (c.persona_id || c.personaId));
       return p ? p.name : "Default";
     },
     get currentModel() {
@@ -667,7 +787,7 @@ function webchat({ prefix }) {
     newChat() {
       this.currentId = null;
       this.messages = [];
-      localStorage.removeItem("webchat:currentId");
+      sessionStorage.removeItem("webchat:currentId");
       // Note: autoAllowTools is NOT reset — "Always Allow" is
       // session-global, not per-chat.
     },
@@ -678,44 +798,70 @@ function webchat({ prefix }) {
       const conv = {
         id,
         title: "New conversation",
-        personaId: persona.id,
+        persona_id: persona.id,
         model: this.setupModel,
         params: this.setupEffectiveParams,
         messages: [],
-        enabledTools: this.allTools.map((t) => t.name),
-        createdAt: Date.now(),
+        enabled_tools: this.allTools.map((t) => t.name),
+        created_at: Date.now(),
+        updated_at: Date.now(),
       };
       // Seed the system prompt from the persona
       if (persona.system_prompt) {
-        conv.messages.push({ role: "system", content: persona.system_prompt });
+        conv.messages.push({ id: "msg-" + (++_msgSeq), role: "system", content: persona.system_prompt });
       }
       this.conversations.unshift(conv);
       this.currentId = id;
       sessionStorage.setItem("webchat:currentId", id);
       this.messages = conv.messages;
-      this.enabledTools = conv.enabledTools;
-      this.writeStorage();
+      this.enabledTools = conv.enabled_tools;
+      if (!this._serverMode) {
+        // sessionStorage mode needs the full conversation (with messages)
+        // stored locally — server mode saves via persist() on first send.
+        this.writeStorage();
+      }
       this.$nextTick(() => this.$refs.composer && this.$refs.composer.focus());
     },
 
-    loadConversation(id) {
-      const c = this.conversations.find((x) => x.id === id);
-      if (!c) return;
-      this.currentId = id;
-      sessionStorage.setItem("webchat:currentId", id);
-      this.messages = c.messages;
-      this.enabledTools = c.enabledTools || this.allTools.map((t) => t.name);
-      // Loading an existing conversation: park at the bottom and refocus so
-      // the user can immediately continue typing.
-      this.userHasScrolled = false;
-      this.scrollToBottom();
-      this.focusComposer();
+    async loadConversation(id) {
+      if (this._serverMode) {
+        try {
+          const r = await fetch(`${this.prefix}/api/conversations/${id}`);
+          if (!r.ok) return;
+          const data = await r.json();
+          this.currentId = id;
+          sessionStorage.setItem("webchat:currentId", id);
+          this.messages = this.normalizeMessages(data.messages);
+          this.enabledTools = data.enabled_tools || this.allTools.map((t) => t.name);
+          // Clear unread flag when viewing.
+          const conv = this.conversations.find((c) => c.id === id);
+          if (conv) conv.unread = false;
+          this.userHasScrolled = false;
+          this.scrollToBottom();
+          this.focusComposer();
+        } catch {}
+      } else {
+        const c = this.conversations.find((x) => x.id === id);
+        if (!c) return;
+        this.currentId = id;
+        sessionStorage.setItem("webchat:currentId", id);
+        this.messages = c.messages;
+        this.enabledTools = c.enabled_tools || this.allTools.map((t) => t.name);
+        this.userHasScrolled = false;
+        this.scrollToBottom();
+        this.focusComposer();
+      }
     },
 
     deleteCurrent() {
       if (!this.currentId) return;
-      this.conversations = this.conversations.filter((c) => c.id !== this.currentId);
-      this.writeStorage();
+      const id = this.currentId;
+      if (this._serverMode) {
+        fetch(`${this.prefix}/api/conversations/${id}`, { method: "DELETE" }).catch(() => {});
+      } else {
+        this.conversations = this.conversations.filter((c) => c.id !== id);
+        this.writeStorage();
+      }
       this.currentId = null;
       sessionStorage.removeItem("webchat:currentId");
       this.messages = [];
@@ -723,9 +869,41 @@ function webchat({ prefix }) {
 
     persist() {
       const c = this.current();
-      if (c) {
+      if (!c) return;
+      if (this._serverMode) {
+        const conv = {
+          id: c.id,
+          title: c.title,
+          persona_id: c.persona_id,
+          model: c.model,
+          params: c.params,
+          created_at: c.created_at || Date.now(),
+          updated_at: Date.now(),
+          messages: this.messages.map((m) => {
+            const copy = { ...m };
+            delete copy.showThinking;
+            return copy;
+          }),
+          enabled_tools: this.enabledTools,
+        };
+        // Update the local summary in-place.
+        c.title = conv.title;
+        c.updated_at = conv.updated_at;
+        if (!c.persona_id) c.persona_id = conv.persona_id;
+        if (!c.model) c.model = conv.model;
+        // Tag this save so our own SSE event is ignored (prevents
+        // loadConversationList from replacing the conversations array
+        // with summaries mid-turn, which could lose unsaved data).
+        this._lastSavedId = c.id;
+        this._lastSavedAt = Date.now();
+        fetch(`${this.prefix}/api/conversations/${c.id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(conv),
+        }).catch(() => {});
+      } else {
         c.messages = this.messages;
-        c.enabledTools = this.enabledTools;
+        c.enabled_tools = this.enabledTools;
         this.writeStorage();
       }
     },
@@ -949,7 +1127,7 @@ function webchat({ prefix }) {
       // treat the rest of the message (or the next message) as code.
       let openCodeFences = 0;
       try {
-        const persona = this.personas.find((p) => p.id === this.current()?.personaId);
+        const persona = this.personas.find((p) => p.id === this.current()?.persona_id);
         const params = this.current()?.params || (persona && persona.params) || {};
         const tools = this.allTools.filter((t) => this.enabledTools.includes(t.name));
 
@@ -1040,14 +1218,10 @@ function webchat({ prefix }) {
             }
             this.scrollToBottom();
           } else if (ev.type === "done") {
-            // Refresh MCP content after each turn — tools, prompts, and
-            // resources may have changed (e.g. a tool call registered
-            // new content, or the operator added a persona). Fire-and-
-            // forget; the dropdowns will be fresh next time the user
-            // types / or @. No ticker, no polling.
-            this.loadTools();
-            this.loadPrompts();
-            this.loadResources();
+            // Tools/prompts/resources changes are pushed via SSE events
+            // (subscribeToEvents). In sessionStorage mode without SSE,
+            // they refresh on page reload — acceptable since sessionStorage
+            // is ephemeral.
           } else if (ev.type === "error") {
             reactiveAssistant.content += `[stream error] ${ev.error}`;
           }
@@ -1119,9 +1293,10 @@ function webchat({ prefix }) {
       } finally {
         this.streaming = false;
         this.abortController = null;
-        // Turn is back to the user (or pending tool approval — either way
-        // the next legitimate input is the user's). Refocus the composer
-        // so they can keep typing without mousing back to the textarea.
+        // Safety-net persist: guarantees the full conversation (including
+        // the last assistant response) is saved even if earlier persist
+        // calls raced with SSE-driven list refreshes.
+        this.persist();
         this.focusComposer();
         this.scrollToBottom();
       }

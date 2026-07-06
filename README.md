@@ -100,18 +100,64 @@ srv, err := webchat.New(webchat.Config{
     CommandsDir:  "/etc/myapp/commands",
     Host:         myHost,
     AuthMiddleware: authMiddleware,  // wraps every handler; nil = no auth
-    Title:        "Chat",
-    HostJSFile:   "/assets/main.js", // host bundle that boots window.Alpine
-    HostCSSFile:  "/assets/main.css", // optional, Tailwind base
-    ExtraNav: []webchat.NavItem{
-        {Href: "/", Label: "Home"},
-    },
+    History:      historyStore,      // nil = browser sessionStorage fallback
+    Events:       eventBroadcaster,  // nil = no SSE push (browser polls)
 })
-if err != nil {
-    log.Fatal(err)
+```
+
+## Conversation history (pluggable persistence)
+
+By default (when `Config.History` is nil), conversations live in browser `sessionStorage` — ephemeral, per-tab, cleared on browser close. No server-side storage, no cross-tab sync.
+
+When `Config.History` is set to a `HistoryStore` implementation, webchat mounts conversation CRUD endpoints and the browser switches to server-side mode automatically:
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `{prefix}/api/conversations` | GET | List all conversation summaries (no messages, ETag-cached) |
+| `{prefix}/api/conversations/{id}` | GET | Full conversation with messages |
+| `{prefix}/api/conversations/{id}` | PUT | Create or update |
+| `{prefix}/api/conversations/{id}` | DELETE | Delete |
+
+The browser detects server-side mode on init by probing `GET /api/conversations`. If it returns 200, all conversation CRUD goes through the API. If 404 (HistoryStore not configured), it falls back to sessionStorage. No configuration needed on the browser side.
+
+### HistoryStore interface
+
+```go
+type HistoryStore interface {
+    List(ctx context.Context) ([]ConversationSummary, error)
+    Get(ctx context.Context, id string) (*StoredConversation, error)
+    Save(ctx context.Context, conv *StoredConversation) error
+    Delete(ctx context.Context, id string) error
 }
-defer srv.Close()
-srv.Mount(mux)
+```
+
+`ConversationSummary` is the lightweight sidebar entry (id, title, persona, model, timestamps). `StoredConversation` embeds it and adds `Messages` and `EnabledTools`. For per-user stores (knot), extract the user from the context.
+
+### llmrouter implementation
+
+Uses snapshotkv (the same persistent store as MCP server config, but with a separate key prefix):
+
+| Data | Key prefix | Store |
+|------|-----------|-------|
+| MCP server config | `mcp_servers:` | shared snapshotkv DB |
+| Chat history | `chat_history:` | shared snapshotkv DB |
+| OpenAI Responses conversations | `conversations:` | shared snapshotkv DB |
+
+All three share one snapshotkv database file but use distinct key prefixes, so they never collide. The `FindKeysByPrefix` scans are prefix-scoped. Memory-only mode (no `--storage-path`) falls back to an in-memory map — conversations work during the process but don't persist across restarts.
+
+### SSE event stream (cross-tab sync + push notifications)
+
+When `Config.Events` is set to an `*EventBroadcaster`, webchat mounts `GET {prefix}/api/events` — a single SSE endpoint per browser tab. The server pushes:
+
+| Event | When | Browser action |
+|-------|------|----------------|
+| `conversation_saved` | Any tab saves a conversation | Refresh sidebar |
+| `conversation_deleted` | Any tab deletes a conversation | Refresh sidebar, clear if current |
+| `tools_changed` | Scriptling watcher detects file change | ETag-fetch tools |
+| `prompts_changed` | Scriptling watcher detects file change | ETag-fetch prompts |
+| `resources_changed` | Scriptling watcher detects file change | ETag-fetch resources |
+
+This replaces polling — no fetch-on-done, no timers. Changes are pushed the instant they happen. The browser uses `EventSource` (native SSE client) which auto-reconnects on disconnect.
 ```
 
 That registers:

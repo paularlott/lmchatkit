@@ -43,6 +43,17 @@ type Config struct {
 	// responsibility to enforce authentication, sessions, rate limiting, etc.
 	// nil means no auth (rare; only appropriate for fully internal hosts).
 	AuthMiddleware func(http.Handler) http.Handler
+
+	// History persists chat conversations server-side. nil = browser
+	// sessionStorage (no persistence across browser restarts, no
+	// cross-tab sync). When non-nil, conversation CRUD endpoints are
+	// mounted and the browser switches to server-side mode automatically.
+	History HistoryStore
+
+	// Events broadcasts changes to connected SSE clients for cross-tab
+	// sync and push notifications (tools/prompts/resources changed).
+	// nil = no SSE (browser falls back to polling on chat completion).
+	Events *EventBroadcaster
 }
 
 // Server is a self-contained chat UI + backend. Build one with [New] and
@@ -154,6 +165,17 @@ func (s *Server) Mount(mux *http.ServeMux) {
 
 	// Static assets (chat.js, chat.css, markdown.js bundles).
 	mux.HandleFunc(prefix+"/assets/", wrapf(s.handleAsset))
+
+	// Conversation CRUD — only mounted when a HistoryStore is configured.
+	if s.cfg.History != nil {
+		mux.HandleFunc(prefix+"/api/conversations", wrapf(s.handleConversations))
+		mux.HandleFunc(prefix+"/api/conversations/", wrapf(s.handleConversation))
+	}
+
+	// SSE event stream — only mounted when an EventBroadcaster is configured.
+	if s.cfg.Events != nil {
+		mux.HandleFunc(prefix+"/api/events", wrapf(s.handleEvents))
+	}
 }
 
 // hostCtxKey is a context key for stashing the authenticated user info the

@@ -28,15 +28,29 @@ const (
 
 // Message is one turn in a conversation. Content is normally a string, but
 // when a message carries resource attachments the frontend may send it as
-// an OpenAI-compatible content array: [{type:"text",text:"..."},{type:"image_url",...}].
-// The Go type uses interface{} to accept both shapes and pass them through
-// to the host's Complete implementation verbatim.
+// an OpenAI-compatible content array. The Go type uses interface{} to
+// accept both shapes and pass them through to the host's Complete
+// implementation verbatim.
+//
+// ID, Thinking, and Info are UI-only fields that the frontend sets on
+// messages for display purposes (Alpine x-for keys, reasoning disclosure,
+// info cards). They are persisted in conversation history so the UI can
+// reconstruct the exact display on reload, but the chat handler strips
+// them before passing messages to Host.Complete — the LLM never sees them.
+//
+// Content does NOT use omitempty — empty string content must be preserved
+// when saving/loading conversations from the history store. With omitempty,
+// an empty assistant message would lose its "content" key entirely, and
+// on reload the browser would see `undefined` instead of `""`.
 type Message struct {
-	Role       Role       `json:"role"`
-	Content    any        `json:"content,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	ToolName   string     `json:"tool_name,omitempty"`
+	ID         string                 `json:"id,omitempty"`
+	Role       Role                   `json:"role"`
+	Content    any                    `json:"content"`
+	Thinking   string                 `json:"thinking,omitempty"`
+	Info       map[string]interface{} `json:"info,omitempty"`
+	ToolCalls  []ToolCall             `json:"tool_calls,omitempty"`
+	ToolCallID string                 `json:"tool_call_id,omitempty"`
+	ToolName   string                 `json:"tool_name,omitempty"`
 }
 
 // ToolCall is a single tool invocation requested by the model. Arguments is

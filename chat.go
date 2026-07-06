@@ -39,6 +39,23 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Strip UI-only fields (ID, Thinking, Info) and filter out synthetic
+	// info-card messages before passing to the host. These are display
+	// metadata (Alpine keys, reasoning disclosure, info cards) that the
+	// LLM should never see. Filtering here means hosts don't have to
+	// know about frontend concerns.
+	cleaned := make([]Message, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		if m.Info != nil {
+			continue
+		}
+		m.ID = ""
+		m.Thinking = ""
+		m.Info = nil
+		cleaned = append(cleaned, m)
+	}
+	req.Messages = cleaned
+
 	// Resolve @resource URIs and /prompt slash commands in user messages
 	// server-side. The browser sends raw text; the server resolves
 	// everything before forwarding to the host.
