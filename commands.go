@@ -206,28 +206,3 @@ func isValidCommandName(s string) bool {
 	}
 	return true
 }
-
-// render substitutes $ARGUMENTS in the command body with the given argument
-// string (which may be empty). The substitution is literal — no shell quoting
-// is applied — so the resulting message reaches the model verbatim.
-func (c SlashCommand) render(arguments string) string {
-	return strings.ReplaceAll(c.Body, "$ARGUMENTS", arguments)
-}
-
-// commandName extracts the command name (lowercased, no slash) from a user
-// message beginning with "/", plus the trailing argument string. Returns
-// ok=false if the input is not a slash command. The command name is
-// lowercased so /Help and /help both resolve.
-func parseSlashInput(input string) (name string, arguments string, ok bool) {
-	s := strings.TrimSpace(input)
-	if !strings.HasPrefix(s, "/") || len(s) == 1 {
-		return "", "", false
-	}
-	rest := s[1:]
-	// Split on first whitespace.
-	idx := strings.IndexAny(rest, " \t\n")
-	if idx == -1 {
-		return strings.ToLower(rest), "", true
-	}
-	return strings.ToLower(rest[:idx]), strings.TrimSpace(rest[idx:]), true
-}

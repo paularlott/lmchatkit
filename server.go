@@ -1,7 +1,6 @@
 package webchat
 
 import (
-	"context"
 	"embed"
 	"io"
 	"net/http"
@@ -175,21 +174,6 @@ func (s *Server) Mount(mux *http.ServeMux) {
 	if s.cfg.Events != nil {
 		mux.HandleFunc(prefix+"/api/events", wrapf(s.handleEvents))
 	}
-}
-
-// hostCtxKey is a context key for stashing the authenticated user info the
-// host's AuthMiddleware attaches. Reserved for future per-user logic.
-type hostCtxKey struct{}
-
-// withUser attaches a user identity into the request context. Hosts may call
-// this from their AuthMiddleware so handlers can read it via [userFrom].
-func withUser(r *http.Request, user any) *http.Request {
-	return r.WithContext(context.WithValue(r.Context(), hostCtxKey{}, user))
-}
-
-// userFrom extracts a previously-attached user. Returns nil if none.
-func userFrom(r *http.Request) any {
-	return r.Context().Value(hostCtxKey{})
 }
 
 //go:embed web/src/chat.js

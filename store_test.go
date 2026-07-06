@@ -282,34 +282,6 @@ func TestCommandStoreLoadsMarkdown(t *testing.T) {
 	if help.Name != "help" {
 		t.Fatalf("help command not found")
 	}
-	rendered := help.render("foo bar")
-	if rendered != "Available commands: /clear, /model. Args: foo bar" {
-		t.Fatalf("rendered: %q", rendered)
-	}
-}
-
-func TestParseSlashInput(t *testing.T) {
-	cases := []struct {
-		in       string
-		name     string
-		args     string
-		ok       bool
-	}{
-		{"/help", "help", "", true},
-		{"/help me please", "help", "me please", true},
-		{"/HELP", "help", "", true}, // lowercased
-		{"hello", "", "", false},
-		{"/", "", "", false},
-		{"", "", "", false},
-		{"/\ttabs", "", "tabs", true}, // tabs split too
-	}
-	for _, c := range cases {
-		got, args, ok := parseSlashInput(c.in)
-		if ok != c.ok || got != c.name || args != c.args {
-			t.Errorf("parseSlashInput(%q) = (%q,%q,%v) want (%q,%q,%v)",
-				c.in, got, args, ok, c.name, c.args, c.ok)
-		}
-	}
 }
 
 func write(t *testing.T, path string, data []byte) {

@@ -9,7 +9,9 @@ import (
 // the browser uses sessionStorage (no server-side persistence, no
 // cross-tab sync). Hosts implement this with KV stores, databases,
 // files — whatever fits. For per-user stores (knot), the implementation
-// extracts the user from the context.
+// extracts the user from the request context; webchat passes ctx through
+// unchanged, so the host owns both the identity context key (set in its
+// auth middleware) and its interpretation here.
 type HistoryStore interface {
 	List(ctx context.Context) ([]ConversationSummary, error)
 	Get(ctx context.Context, id string) (*StoredConversation, error)
