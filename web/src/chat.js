@@ -1396,55 +1396,10 @@ function webchat({ prefix }) {
         return true;
       }
 
-      // 2. MCP prompts: if the name matches a prompt, parse args and
-      // call prompts/get. Supports key=value pairs and positional
-      // shorthand for single-arg prompts.
-      const prompt = (this.prompts || []).find((p) => p.name === name);
-      if (prompt) {
-        const argParts = args ? args.split(/\s+/) : [];
-        const parsedArgs = {};
-        const declared = prompt.arguments || [];
-        const requiredArgs = declared.filter((a) => a.required);
-        const hasPositional = argParts.length > 0 && !argParts[0].includes("=");
-        if (hasPositional && requiredArgs.length === 1) {
-          // Single required arg: treat the whole remainder as its value.
-          // `/explain mcp` → {concept: "mcp"} even though there's also an
-          // optional "level" arg. Optional args are left unset.
-          parsedArgs[requiredArgs[0].name] = argParts.join(" ");
-        } else {
-          for (const part of argParts) {
-            const eq = part.indexOf("=");
-            if (eq > 0) parsedArgs[part.substring(0, eq)] = part.substring(eq + 1);
-          }
-        }
-        try {
-          const r = await fetch(`${this.prefix}/api/prompts/get`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name, args: parsedArgs }),
-          });
-          if (!r.ok) {
-            const err = await r.json().catch(() => ({ error: `server returned ${r.status}` }));
-            this.messages.push({ id: "msg-" + (++_msgSeq), role: "assistant", content: `[error] Prompt "${name}" failed: ${err.error || r.status}` });
-            this.scrollToBottom();
-            return true;
-          }
-          const data = await r.json();
-          if (data.messages && data.messages.length > 0) {
-            for (const m of data.messages) {
-              this.messages.push({ id: "msg-" + (++_msgSeq), role: m.role, content: m.content });
-            }
-            this.scrollToBottom();
-            this.persist();
-            await this.streamTurn();
-          }
-        } catch (e) {
-          this.messages.push({ id: "msg-" + (++_msgSeq), role: "assistant", content: `[error] Failed to render prompt: ${e.message}` });
-          this.scrollToBottom();
-        }
-        return true;
-      }
-
+      // 2. MCP prompts: resolved server-side. Send the raw /name args
+      // text as a user message — the server calls prompts/get and
+      // injects the rendered messages before forwarding to the LLM.
+      // The transcript shows the original /name args text.
       return false;
     },
 

@@ -39,10 +39,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve @resource URIs in user messages server-side. Each @uri
-	// is replaced with a content block (text or image_url). The LLM
-	// sees the resource content; the transcript keeps the @uri text.
+	// Resolve @resource URIs and /prompt slash commands in user messages
+	// server-side. The browser sends raw text; the server resolves
+	// everything before forwarding to the host.
 	req.Messages = s.resolveResourceRefs(r, req.Messages)
+	req.Messages = s.resolveSlashCommands(r, req.Messages)
 
 	// Stream setup.
 	flusher, ok := w.(http.Flusher)
@@ -156,4 +157,119 @@ func (s *Server) resolveResourceRefs(r *http.Request, messages []Message) []Mess
 		}
 	}
 	return messages
+}
+
+// slashCommandPattern matches /commandname at the start of a message.
+var slashCommandPattern = regexp.MustCompile(`^/(\w[\w-]*)\s*(.*)$`)
+
+// resolveSlashCommands scans user messages for /commandname patterns.
+// If the command matches a known MCP prompt (via the host), the prompt
+// is rendered server-side and the single user message is replaced with
+// the prompt's returned messages. File-based commands are handled
+// client-side (already expanded before sending) so they pass through.
+// Unknown /commands pass through as literal text.
+func (s *Server) resolveSlashCommands(r *http.Request, messages []Message) []Message {
+	// Fetch the MCP prompt list once for this request.
+	prompts, err := s.cfg.Host.ListPrompts(r.Context())
+	if err != nil || len(prompts) == 0 {
+		return messages
+	}
+	promptMap := make(map[string]bool, len(prompts))
+	for _, p := range prompts {
+		promptMap[p.Name] = true
+	}
+
+	resolved := make([]Message, 0, len(messages))
+	for _, m := range messages {
+		if string(m.Role) != "user" {
+			resolved = append(resolved, m)
+			continue
+		}
+		text, ok := m.Content.(string)
+		if !ok {
+			resolved = append(resolved, m)
+			continue
+		}
+
+		match := slashCommandPattern.FindStringSubmatch(text)
+		if match == nil {
+			resolved = append(resolved, m)
+			continue
+		}
+
+		name := match[1]
+		argStr := match[2]
+
+		if !promptMap[name] {
+			// Not an MCP prompt — file commands are already expanded
+			// by the browser. Pass through as literal text.
+			resolved = append(resolved, m)
+			continue
+		}
+
+		// Find the prompt declaration to parse args correctly.
+		var prompt *Prompt
+		for i := range prompts {
+			if prompts[i].Name == name {
+				prompt = &prompts[i]
+				break
+			}
+		}
+
+		// Parse arguments: key=value pairs, or positional for
+		// single-required-arg prompts.
+		args := parsePromptArgs(argStr, prompt)
+
+		result, err := s.cfg.Host.GetPrompt(r.Context(), name, args)
+		if err != nil {
+			resolved = append(resolved, Message{
+				Role:    "assistant",
+				Content: "[error: prompt " + name + " failed: " + err.Error() + "]",
+			})
+			continue
+		}
+
+		// Replace the single user message with the prompt's messages.
+		for _, pm := range result.Messages {
+			resolved = append(resolved, Message{
+				Role:    pm.Role,
+				Content: pm.Content,
+			})
+		}
+	}
+	return resolved
+}
+
+// parsePromptArgs converts the argument string into a map. Supports
+// key=value pairs and positional shorthand for single-required-arg prompts.
+func parsePromptArgs(argStr string, prompt *Prompt) map[string]string {
+	args := map[string]string{}
+	if argStr == "" || prompt == nil {
+		return args
+	}
+	parts := splitArgs(argStr)
+	declared := prompt.Arguments
+	required := []PromptArgument{}
+	for _, a := range declared {
+		if a.Required {
+			required = append(required, a)
+		}
+	}
+
+	if len(required) == 1 && len(parts) > 0 && !strings.Contains(parts[0], "=") {
+		args[required[0].Name] = strings.Join(parts, " ")
+		return args
+	}
+
+	for _, part := range parts {
+		eq := strings.Index(part, "=")
+		if eq > 0 {
+			args[part[:eq]] = part[eq+1:]
+		}
+	}
+	return args
+}
+
+func splitArgs(s string) []string {
+	return strings.Fields(s)
 }
