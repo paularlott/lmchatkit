@@ -49,53 +49,14 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	writeJSONWithETag(w, r, models)
 }
 
-// chatRequest is the body shape expected by POST /api/chat. Messages is the
-// full conversation. PersonaParams and PersonaSystemPrompt are pre-merged by
-// the frontend (or, if the frontend passed a PersonaID, the backend will
-// merge here) — kept simple: frontend merges persona, sends everything
-// explicitly. PersonaID is captured for analytics only.
+// chatRequest is the body shape expected by POST /api/chat. The server
+// derives the system prompt from the persona and builds the tool list
+// from the host — the browser sends neither.
 type chatRequest struct {
-	Model             string                 `json:"model"`
-	Messages          []Message              `json:"messages"`
-	Tools             []Tool                 `json:"tools,omitempty"`
-	Params            map[string]interface{} `json:"params,omitempty"`
-	DisabledTools     []string               `json:"disabled_tools,omitempty"`
-}
-
-// handleListTools returns the tools currently available to chat — i.e. the
-// host's full tool list minus anything the user has disabled. The disabled
-// list is sent by the frontend (per-session LocalStorage) so different users
-// on the same host can have different tool sets without host-level config.
-func (s *Server) handleListTools(w http.ResponseWriter, r *http.Request) {
-	tools, err := s.host.ListTools(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	disabled := querySlice(r, "disabled")
-	if len(disabled) == 0 {
-		// Try the JSON-body path as well (some clients POST a list).
-		if r.Method == http.MethodPost {
-			var body struct{ Disabled []string `json:"disabled"` }
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			disabled = body.Disabled
-		}
-	}
-	if len(disabled) == 0 {
-		writeJSONWithETag(w, r, tools)
-		return
-	}
-	set := make(map[string]bool, len(disabled))
-	for _, d := range disabled {
-		set[d] = true
-	}
-	out := make([]Tool, 0, len(tools))
-	for _, t := range tools {
-		if !set[t.Name] {
-			out = append(out, t)
-		}
-	}
-	writeJSONWithETag(w, r, out)
+	Model     string                 `json:"model"`
+	PersonaID string                 `json:"persona_id"`
+	Messages  []Message              `json:"messages"`
+	Params    map[string]interface{} `json:"params,omitempty"`
 }
 
 // toolCallRequest is the body shape for /api/tools/call.
@@ -116,6 +77,15 @@ func (s *Server) handleCallTool(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
 	}
+
+	// Intercept the virtual skill-retrieval tool — route to ReadResource
+	// instead of the host's CallTool (the skill tool is not registered
+	// on the MCP server).
+	if result, handled := s.trySkillToolCall(r.Context(), req.Name, req.Arguments); handled {
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+
 	res, err := s.host.CallTool(r.Context(), req.Name, req.Arguments)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -265,39 +235,4 @@ func writeJSONWithETag(w http.ResponseWriter, r *http.Request, v interface{}) {
 // writeError writes an error response in the conventional {error: ...} shape.
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
-}
-
-// querySlice splits a comma-separated query parameter into a slice.
-func querySlice(r *http.Request, key string) []string {
-	v := r.URL.Query()[key]
-	if len(v) == 0 {
-		return nil
-	}
-	var out []string
-	for _, item := range v {
-		for _, part := range splitCSV(item) {
-			if part != "" {
-				out = append(out, part)
-			}
-		}
-	}
-	return out
-}
-
-// splitCSV is a tiny helper to keep the import block small; comma splitting
-// only, no quoting. Lower-latency than pulling encoding/csv.
-func splitCSV(s string) []string {
-	if s == "" {
-		return nil
-	}
-	var out []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == ',' {
-			out = append(out, s[start:i])
-			start = i + 1
-		}
-	}
-	out = append(out, s[start:])
-	return out
 }

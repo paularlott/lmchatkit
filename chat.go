@@ -39,34 +39,61 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Strip UI-only fields (ID, Thinking, Info) and filter out synthetic
-	// info-card messages before passing to the host. These are display
-	// metadata (Alpine keys, reasoning disclosure, info cards) that the
-	// LLM should never see. Filtering here means hosts don't have to
-	// know about frontend concerns.
+	// Strip UI-only fields (ID, Thinking, Info), filter out synthetic
+	// info-card messages, drop empty assistant bubbles, and strip any
+	// system messages (the server derives the system prompt from the
+	// persona — the browser never sends system messages).
 	cleaned := make([]Message, 0, len(req.Messages))
 	for _, m := range req.Messages {
-		if m.Info != nil {
+		if m.Info != nil || m.Role == RoleSystem {
 			continue
+		}
+		// Drop assistant messages with no content and no tool calls.
+		if m.Role == RoleAssistant {
+			content, _ := m.Content.(string)
+			if content == "" && len(m.ToolCalls) == 0 {
+				continue
+			}
 		}
 		m.ID = ""
 		m.Thinking = ""
 		m.Info = nil
 		cleaned = append(cleaned, m)
 	}
-	req.Messages = cleaned
 
-	// Dynamically augment the system prompt if the host supports it.
-	// Called on every request so dynamic content (like available skills)
-	// stays current without persisting to conversation history.
-	if a, ok := s.host.(SystemPromptAugmenter); ok {
-		for i := range req.Messages {
-			if req.Messages[i].Role == RoleSystem {
-				current, _ := req.Messages[i].Content.(string)
-				req.Messages[i].Content = a.AugmentSystemPrompt(r.Context(), current)
-				break // only augment the first system message
+	// Derive the system prompt from the persona. The persona store is
+	// an in-memory cache with file watching — the lookup is a map read
+	// and the prompt is always current with the persona file.
+	var systemPrompt string
+	if req.PersonaID != "" && s.personas != nil {
+		personas, _ := s.personas.Personas(r.Context())
+		for _, p := range personas {
+			if p.ID == req.PersonaID {
+				systemPrompt = p.SystemPrompt
+				break
 			}
 		}
+	}
+
+	// Dynamically augment the system prompt if the host supports it.
+	if a, ok := s.host.(SystemPromptAugmenter); ok {
+		systemPrompt = a.AugmentSystemPrompt(r.Context(), systemPrompt)
+	}
+
+	// Prepend the system message. Always present so model templates
+	// (e.g. Gemma's Jinja) see a valid conversation structure.
+	req.Messages = append([]Message{{Role: RoleSystem, Content: systemPrompt}}, cleaned...)
+
+	// Build the tool list entirely server-side. The browser doesn't
+	// send tool definitions or a disabled list — it only handles the
+	// approval flow (Allow / Always Allow / Deny) when tool calls come
+	// back. Tool enable/disable is managed at the MCP server level.
+	tools, _ := s.host.ListTools(r.Context())
+
+	// Inject the virtual skill-retrieval tool when skill:// resources
+	// exist. Server-side only — not in any user-visible tool list.
+	if s.hasSkillResources(r.Context()) {
+		tools = append(tools, SkillTool)
 	}
 
 	// Resolve @resource URIs and /prompt slash commands in user messages
@@ -95,7 +122,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		err := s.host.Complete(r.Context(), CompleteRequest{
 			Model:    req.Model,
 			Messages: req.Messages,
-			Tools:    req.Tools,
+			Tools:    tools,
 			Params:   req.Params,
 		}, events)
 		done <- err

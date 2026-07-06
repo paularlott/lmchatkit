@@ -156,7 +156,6 @@ func (s *Server) Mount(mux *http.ServeMux) {
 	mux.HandleFunc(prefix+"/api/commands", wrapf(s.handleCommands))
 	mux.HandleFunc(prefix+"/api/models", wrapf(s.handleModels))
 	mux.HandleFunc(prefix+"/api/chat", wrapf(s.handleChat))
-	mux.HandleFunc(prefix+"/api/tools", wrapf(s.handleListTools))
 	mux.HandleFunc(prefix+"/api/tools/call", wrapf(s.handleCallTool))
 	mux.HandleFunc(prefix+"/api/prompts", wrapf(s.handleListPrompts))
 	mux.HandleFunc(prefix+"/api/prompts/get", wrapf(s.handleGetPrompt))

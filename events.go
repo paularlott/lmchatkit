@@ -7,9 +7,10 @@ import (
 
 // handleEvents is the SSE endpoint at GET /api/events. Clients connect
 // once (one per browser tab) and receive push notifications for:
-//   - conversation_saved / conversation_deleted (cross-tab sync)
-//   - tools_changed / prompts_changed / resources_changed (scriptling
-//     watcher detected file changes — replaces fetch-on-done)
+//   - conversation_saved / conversation_deleted / conversation_renamed
+//     (cross-tab sync)
+//   - prompts_changed / resources_changed (scriptling watcher detected
+//     file changes — replaces fetch-on-done)
 //
 // The connection stays open until the client disconnects or the server
 // shuts down. EventSource in the browser handles auto-reconnect.

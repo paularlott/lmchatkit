@@ -10,7 +10,7 @@ Built for — and extracted from — `paularlott/llmrouter`, with the contract s
 - **Persona loading** from a watched TOML directory (`system_prompt`, `default_model`, `[params]` table). Hot-reloads on file change. A built-in `Default` persona is always offered even when the dir is empty.
 - **Slash commands** from a watched markdown directory. `help.md` → `/help`. `$ARGUMENTS` in the body is spliced with whatever the user typed after the command.
 - **MCP pass-through** for tools, prompts, and resources via the `Host` interface — the host decides where they come from.
-- **Tool-call confirmation flow** with per-session auto-allow and per-chat disable, persisted in browser `localStorage`. No server-side per-user state.
+- **Tool-call confirmation flow** with per-session auto-allow, persisted in browser `sessionStorage`. The server owns the tool list; the browser only handles approval (Allow / Always Allow / Deny).
 - **Bundles its own HTML/CSS/JS** — the host just calls `Mount(mux)`. The frontend reuses the host's bundled Alpine + Tailwind; webchat doesn't ship a copy.
 - **Auth is host-owned** — pass an `AuthMiddleware` in `Config` and it wraps every webchat handler.
 
@@ -47,6 +47,16 @@ type Host interface {
 ```
 
 `Host` must be safe for concurrent use — webchat is stateless and one `Server` may serve many simultaneous sessions across many users.
+
+### Optional interfaces
+
+Hosts may implement additional interfaces for extended behaviour:
+
+| Interface | Method | Effect |
+|-----------|--------|--------|
+| `SystemPromptAugmenter` | `AugmentSystemPrompt(ctx, current) string` | Dynamically augment the system prompt on every chat request (e.g. append a skill index). Transient — conversation history is not modified. |
+
+`StandardHost` implements `SystemPromptAugmenter` via a function field (nil = passthrough).
 
 ## Persona & slash-command sources
 
@@ -153,7 +163,7 @@ When `Config.Events` is set to an `*EventBroadcaster`, webchat mounts `GET {pref
 |-------|------|----------------|
 | `conversation_saved` | Any tab saves a conversation | Refresh sidebar |
 | `conversation_deleted` | Any tab deletes a conversation | Refresh sidebar, clear if current |
-| `tools_changed` | Scriptling watcher detects file change | ETag-fetch tools |
+| `conversation_renamed` | Any tab renames a conversation | Refresh sidebar |
 | `prompts_changed` | Scriptling watcher detects file change | ETag-fetch prompts |
 | `resources_changed` | Scriptling watcher detects file change | ETag-fetch resources |
 
@@ -168,13 +178,12 @@ That registers:
 | `GET /chat/api/personas`           | Persona list (incl. built-in `Default`)            |
 | `GET /chat/api/commands`           | Slash-command list (incl. rendered markdown body)  |
 | `GET /chat/api/models`             | Models from `Host.Models`                          |
-| `GET /chat/api/tools`              | Tools from `Host.ListTools`, with `?disabled=`     |
-| `POST /chat/api/tools/call`        | Execute one tool                                   |
+| `POST /chat/api/chat`              | Streaming completion (SSE response)                |
+| `POST /chat/api/tools/call`        | Execute one tool (after user approval)             |
 | `GET /chat/api/prompts`            | Prompts from `Host.ListPrompts`                    |
 | `POST /chat/api/prompts/get`       | Render a prompt                                    |
 | `GET /chat/api/resources`          | Resources (static + templates) from `Host`         |
 | `POST /chat/api/resources/read`    | Read one resource                                  |
-| `POST /chat/api/chat`              | Streaming completion (SSE response)                |
 | `GET /chat/assets/*`               | Embedded `chat.js` bundle                          |
 
 ## Chat protocol
@@ -196,7 +205,13 @@ Event types: `delta` (visible text), `reasoning` (thinking/reasoning text, rende
 
 The frontend reads with `fetch` + `ReadableStream` (not `EventSource` — `EventSource` can't POST). On `tool_call`, the UI prompts the user; on approve it `POST /api/tools/call`s the tool, appends the result to the conversation, and re-`POST /api/chat`s to continue. On `done` or `error` the turn finalizes.
 
+### Tool management
+
+The server owns the tool list entirely. On each `/api/chat` request, the server calls `Host.ListTools` to get available tools, injects the virtual `webchat__get_skill` tool if skills exist, and forwards everything to the LLM. The browser never sees the tool list — it only handles the approval flow (Allow / Always Allow / Deny) when tool calls arrive as SSE events. Tool enable/disable is managed at the MCP server level (e.g. via the admin UI), not per-conversation in the browser.
+
 This protocol is intentionally **not** OpenAI-shaped — the host's `Complete` implementation is free to call OpenAI, Anthropic, a local llama.cpp, or anything else. The reference implementation in `llmrouter` does a loopback HTTP call to its own `/v1/chat/completions` and translates OpenAI's SSE format into webchat events (including `delta.reasoning_content` / `delta.reasoning` → `EventReasoning`).
+
+The chat request body is minimal — `{model, persona_id, messages, params}`. The server derives the system prompt from the persona (looked up by `persona_id` in the in-memory persona cache), builds the tool list from `Host.ListTools`, and injects virtual tools (`webchat__get_skill`). The browser never sends system messages or tool definitions.
 
 ## Personas
 
@@ -323,6 +338,52 @@ Template resources (with `{var}` placeholders in the URI) appear in the dropdown
 ### Multiple attachments
 
 Multiple `@resource` selections can be attached to a single message. Each is rendered as a separate chip and its content is injected separately.
+
+## Skills (lazy-loaded context via virtual tool)
+
+Skills are resources with a `skill://` URI prefix that the model can retrieve on demand. Unlike `@resource` attachments (which the user manually adds), skills are model-driven — the LLM decides it needs a skill and calls a tool to get it.
+
+### How it works
+
+1. On every `/api/chat` and `/api/tools` request, webchat checks the host for `skill://` resources
+2. If any exist, a virtual tool `webchat__get_skill` is appended to the tool list
+3. The host's `SystemPromptAugmenter` (if implemented) appends skill names + descriptions to the system prompt
+4. The model calls `webchat__get_skill` with a skill URI (e.g. `skill://golang`)
+5. webchat intercepts the call and routes it to `Host.ReadResource` — never touches the MCP server
+6. The skill content is returned as a tool result; the model reads it and continues
+
+The tool is auto-approved by the browser (added to `autoAllowTools` on init) — skill loading is invisible to the user, no approval prompt.
+
+### Why `webchat__get_skill`?
+
+The `webchat__` prefix prevents collisions: local scriptling tools have no prefix, remote MCP tools get their `namespace__` prefix. The tool is conditional — only appears when `skill://` resources exist.
+
+### SystemPromptAugmenter (optional host interface)
+
+Hosts can implement this to dynamically augment the system prompt on every chat request:
+
+```go
+type SystemPromptAugmenter interface {
+    AugmentSystemPrompt(ctx context.Context, current string) string
+}
+```
+
+`StandardHost` implements it via a `SystemPromptAugmenter` function field (nil = passthrough). The returned string replaces the system prompt sent to the LLM. The stored conversation is not modified — augmentation is transient, recomputed on each request.
+
+`StandardHost` also exposes the function directly:
+
+```go
+host := &webchat.StandardHost{
+    SystemPromptAugmenter: func(ctx context.Context, current string) string {
+        return current + "\n\n" + buildSkillIndex(ctx)
+    },
+    // ...
+}
+```
+
+### Skill sources
+
+Skills work from any resource source because the virtual tool calls the standard `Host.ReadResource` — files (scriptling), remote MCP servers, databases, or custom providers. The source is transparent.
 
 ## Frontend
 

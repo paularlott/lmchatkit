@@ -37,7 +37,7 @@ type StoredConversation struct {
 
 // ServerEvent is one event pushed to SSE subscribers.
 type ServerEvent struct {
-	Type string `json:"type"` // conversation_saved, conversation_deleted, tools_changed, prompts_changed, resources_changed
+	Type string `json:"type"` // conversation_saved, conversation_deleted, conversation_renamed, prompts_changed, resources_changed
 	ID   string `json:"id,omitempty"`
 }
 

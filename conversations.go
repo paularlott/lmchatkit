@@ -41,6 +41,16 @@ func (s *Server) handleConversation(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
+		// Strip system messages — the server derives the system prompt
+		// from the persona on each /api/chat request. The browser never
+		// sees or stores system messages.
+		filtered := make([]Message, 0, len(conv.Messages))
+		for _, m := range conv.Messages {
+			if m.Role != RoleSystem {
+				filtered = append(filtered, m)
+			}
+		}
+		conv.Messages = filtered
 		writeJSON(w, http.StatusOK, conv)
 
 	case http.MethodPut:

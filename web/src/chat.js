@@ -286,9 +286,6 @@ function webchat({ prefix }) {
     personas: [{ id: "default", name: "Default" }],
     models: [],
     commands: [],
-    allTools: [],
-    enabledTools: [],
-    showToolsPanel: false,
 
     conversations: [],
     currentId: null,
@@ -403,7 +400,6 @@ function webchat({ prefix }) {
           this.loadPersonas(),
           this.loadModels(),
           this.loadCommands(),
-          this.loadTools(),
           this.loadPrompts(),
           this.loadResources(),
         ]);
@@ -435,6 +431,14 @@ function webchat({ prefix }) {
       try {
         this.autoAllowTools = JSON.parse(sessionStorage.getItem("webchat:autoAllow") || "[]");
       } catch { this.autoAllowTools = []; }
+
+      // Always auto-approve the virtual skill-retrieval tool — it's a
+      // read-only context fetch, not a user-visible action. The model
+      // calls it to load skill instructions; the user never needs to
+      // approve it.
+      if (!this.autoAllowTools.includes("webchat__get_skill")) {
+        this.autoAllowTools.push("webchat__get_skill");
+      }
 
       ["webchat:conversations", "webchat:currentId", "webchat:inputHistory"].forEach((k) => {
         try { localStorage.removeItem(k); } catch {}
@@ -523,7 +527,6 @@ function webchat({ prefix }) {
               // is not new content.
               this.loadConversationList();
               break;
-            case "tools_changed":   this.loadTools(); break;
             case "prompts_changed": this.loadPrompts(); break;
             case "resources_changed": this.loadResources(); break;
           }
@@ -556,19 +559,23 @@ function webchat({ prefix }) {
     // the fields the UI needs: a unique id (Alpine x-for :key — without it
     // duplicate undefined keys cause only the last message to render) and
     // a tool_calls array (so .push/.filter don't crash on undefined).
+    // System messages are stripped — the server derives the system prompt
+    // from the persona on each /api/chat request.
     normalizeMessages(msgs) {
-      return (msgs || []).map((m) => ({
-        ...m,
-        id: m.id || ("msg-" + (++_msgSeq)),
-        tool_calls: m.tool_calls || [],
-      }));
+      return (msgs || [])
+        .filter((m) => m.role !== "system")
+        .map((m) => ({
+          ...m,
+          id: m.id || ("msg-" + (++_msgSeq)),
+          tool_calls: m.tool_calls || [],
+        }));
     },
 
     // reloadCurrentConversation fetches the conversation we're currently
     // viewing and replaces messages in-place. Used when another tab saves
     // the same conversation — the new content appears live. Unlike
     // loadConversation, this does NOT reset currentId, sessionStorage,
-    // enabledTools, or steal focus — those are already correct. It also
+    // or steal focus — those are already correct. It also
     // does NOT force userHasScrolled=false, so if the user scrolled up
     // to read, they stay where they are.
     //
@@ -665,26 +672,6 @@ function webchat({ prefix }) {
         }
       } catch {}
     },
-    async loadTools() {
-      try {
-        const r = await fetch(`${this.prefix}/api/tools`, { headers: this._etagHeaders("tools") });
-        if (r.status === 304) return;
-        if (r.ok) {
-          this._storeETag("tools", r);
-          const data = await r.json();
-          if (Array.isArray(data)) {
-            const prevEnabled = new Set(this.enabledTools);
-            this.allTools = data;
-            this.enabledTools = prevEnabled.size > 0
-              ? this.allTools.filter((t) => prevEnabled.has(t.name)).map((t) => t.name)
-              : this.allTools.map((t) => t.name);
-            if (this.enabledTools.length === 0) {
-              this.enabledTools = this.allTools.map((t) => t.name);
-            }
-          }
-        }
-      } catch {}
-    },
     async loadPrompts() {
       try {
         const r = await fetch(`${this.prefix}/api/prompts`, { headers: this._etagHeaders("prompts") });
@@ -732,7 +719,7 @@ function webchat({ prefix }) {
       const c = this.current();
       return c ? c.model : "";
     },
-    get enabledToolsCount() { return this.enabledTools.length; },
+
 
     // Reference to the last assistant message (or null). Kept for future
     // use; the template currently uses index comparison (idx ===
@@ -869,19 +856,16 @@ function webchat({ prefix }) {
         model: this.setupModel,
         params: this.setupEffectiveParams,
         messages: [],
-        enabled_tools: this.allTools.map((t) => t.name),
         created_at: Date.now(),
         updated_at: Date.now(),
       };
-      // Seed the system prompt from the persona
-      if (persona.system_prompt) {
-        conv.messages.push({ id: "msg-" + (++_msgSeq), role: "system", content: persona.system_prompt });
-      }
+      // No system message — the server derives it from the persona
+      // on each /api/chat request. The browser never stores or sends
+      // system messages.
       this.conversations.unshift(conv);
       this.currentId = id;
       sessionStorage.setItem("webchat:currentId", id);
       this.messages = conv.messages;
-      this.enabledTools = conv.enabled_tools;
       if (!this._serverMode) {
         // sessionStorage mode needs the full conversation (with messages)
         // stored locally — server mode saves via persist() on first send.
@@ -899,10 +883,6 @@ function webchat({ prefix }) {
           this.currentId = id;
           sessionStorage.setItem("webchat:currentId", id);
           this.messages = this.normalizeMessages(data.messages);
-          this.enabledTools = data.enabled_tools || this.allTools.map((t) => t.name);
-          // Clear unread flag when viewing.
-          const conv = this.conversations.find((c) => c.id === id);
-          if (conv) conv.unread = false;
           this.userHasScrolled = false;
           this.scrollToBottom();
           this.focusComposer();
@@ -913,7 +893,6 @@ function webchat({ prefix }) {
         this.currentId = id;
         sessionStorage.setItem("webchat:currentId", id);
         this.messages = c.messages;
-        this.enabledTools = c.enabled_tools || this.allTools.map((t) => t.name);
         this.userHasScrolled = false;
         this.scrollToBottom();
         this.focusComposer();
@@ -988,7 +967,6 @@ function webchat({ prefix }) {
             delete copy.showThinking;
             return copy;
           }),
-          enabled_tools: this.enabledTools,
         };
         // Update the local summary in-place.
         c.title = conv.title;
@@ -1007,7 +985,6 @@ function webchat({ prefix }) {
         }).catch(() => {});
       } else {
         c.messages = this.messages;
-        c.enabled_tools = this.enabledTools;
         this.writeStorage();
       }
     },
@@ -1238,11 +1215,7 @@ function webchat({ prefix }) {
       try {
         const persona = this.personas.find((p) => p.id === this.current()?.persona_id);
         const params = this.current()?.params || (persona && persona.params) || {};
-        const tools = this.allTools.filter((t) => this.enabledTools.includes(t.name));
 
-        // AbortController so the Cancel button can interrupt the fetch
-        // AND the streaming reader. Lives on `this` so the button can
-        // reach it.
         this.abortController = new AbortController();
 
         const r = await fetch(`${this.prefix}/api/chat`, {
@@ -1250,8 +1223,8 @@ function webchat({ prefix }) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             model: this.currentModel,
+            persona_id: this.current()?.persona_id || "",
             messages: this.messages.slice(0, -1),
-            tools,
             params,
           }),
           signal: this.abortController.signal,
@@ -1423,16 +1396,12 @@ function webchat({ prefix }) {
     //   3. An info card showing what was compacted (visible to the user)
     async compactConversation() {
       if (this.streaming) return;
-      const conversational = this.messages.filter((m) => m.role !== "system" && !m.info);
+      const conversational = this.messages.filter((m) => !m.info);
       if (conversational.length < 2) {
         this.renderInfoCard("info", "Nothing to Compact",
           [{ name: "Need at least 2 messages", description: "Compaction is useful for longer conversations." }]);
         return;
       }
-
-      // Preserve the original persona system prompt (first system message).
-      const systemMsgs = this.messages.filter((m) => m.role === "system");
-      const originalSystem = systemMsgs.length > 0 ? systemMsgs[0] : null;
 
       // Pack the entire conversation into a single user message so the
       // model treats this as a summarization task, NOT a live conversation
@@ -1455,9 +1424,10 @@ function webchat({ prefix }) {
         "questions. Omit pleasantries and small talk. The summary must be " +
         "detailed enough to continue the conversation seamlessly.";
 
+      // Pack prompt + transcript into a single user message. The server
+      // injects the persona's system prompt — we don't send system messages.
       const compactMessages = [
-        { role: "system", content: compactPrompt },
-        { role: "user", content: transcript },
+        { role: "user", content: compactPrompt + "\n\nSummarize this conversation:\n\n" + transcript },
       ];
 
       // Push an empty assistant bubble so the loading dots have somewhere
@@ -1515,28 +1485,16 @@ function webchat({ prefix }) {
 
         const oldCount = this.messages.length - 1; // exclude the temp bubble
 
-        // Build the compacted message list: original system prompt + summary.
-        // The summary is stored as an assistant message so:
-        //   - The model sees it as context for continuing the conversation
-        //   - The user can read it (rendered as markdown in the UI)
-        //   - It's transparent — the user knows exactly what the model sees
-        const newMessages = [];
-        if (originalSystem) {
-          newMessages.push({
-            id: "msg-" + (++_msgSeq),
-            role: "system",
-            content: originalSystem.content,
-          });
-        }
-        newMessages.push({
+        // Replace messages with just the summary. The system prompt is
+        // not stored — the server derives it from the persona on each
+        // request, so compaction doesn't need to touch it.
+        this.messages = [{
           id: "msg-" + (++_msgSeq),
           role: "assistant",
           content: summary,
           thinking: "",
           tool_calls: [],
-        });
-
-        this.messages = newMessages;
+        }];
         // The info card tells the user what happened — the assistant
         // message itself is just the raw summary so the model sees clean
         // context, not meta-commentary about compaction.
@@ -1902,13 +1860,6 @@ function webchat({ prefix }) {
         this.copiedIdx = idx;
         setTimeout(() => { if (this.copiedIdx === idx) this.copiedIdx = -1; }, 2000);
       }).catch(() => {});
-    },
-    toggleAllTools(ev) {
-      if (ev.target.checked) {
-        this.enabledTools = this.allTools.map((t) => t.name);
-      } else {
-        this.enabledTools = [];
-      }
     },
   };
 }

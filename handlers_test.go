@@ -86,29 +86,6 @@ func TestHandleModels(t *testing.T) {
 	}
 }
 
-func TestHandleListToolsFiltering(t *testing.T) {
-	host := &fakeHost{tools: []Tool{
-		{Name: "alpha"}, {Name: "beta"}, {Name: "gamma"},
-	}}
-	s := newTestServer(t, host)
-
-	// Disabled list = "beta" -> only alpha+gamma remain
-	req := httptest.NewRequest(http.MethodGet, "/chat/api/tools?disabled=beta", nil)
-	rec := httptest.NewRecorder()
-	s.handleListTools(rec, req)
-
-	var got []Tool
-	_ = json.Unmarshal(rec.Body.Bytes(), &got)
-	if len(got) != 2 {
-		t.Fatalf("expected 2 tools after filter, got %d (%+v)", len(got), got)
-	}
-	for _, tg := range got {
-		if tg.Name == "beta" {
-			t.Fatalf("beta should have been filtered")
-		}
-	}
-}
-
 func TestHandleCallTool(t *testing.T) {
 	host := &fakeHost{
 		callTool: func(ctx context.Context, name string, args json.RawMessage) (ToolResult, error) {
@@ -236,7 +213,6 @@ func TestMountRegistersRoutes(t *testing.T) {
 		"/chat/api/commands",
 		"/chat/api/models",
 		"/chat/api/chat",
-		"/chat/api/tools",
 		"/chat/api/tools/call",
 		"/chat/api/prompts",
 		"/chat/api/prompts/get",
