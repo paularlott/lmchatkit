@@ -219,6 +219,22 @@ func (s *Server) resolveResourceRefs(r *http.Request, messages []Message) []Mess
 // slashCommandPattern matches /commandname at the start of a message.
 var slashCommandPattern = regexp.MustCompile(`^/(\w[\w-]*)\s*(.*)$`)
 
+// hasSlashCandidate reports whether any user message is a string starting with
+// "/", the only case where MCP prompt resolution is needed. Used to skip the
+// host ListPrompts round-trip for ordinary messages.
+func hasSlashCandidate(messages []Message) bool {
+	for _, m := range messages {
+		if string(m.Role) != "user" {
+			continue
+		}
+		text, ok := m.Content.(string)
+		if ok && strings.HasPrefix(text, "/") {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveSlashCommands scans user messages for /commandname patterns.
 // If the command matches a known MCP prompt (via the host), the prompt
 // is rendered server-side and the single user message is replaced with
@@ -226,6 +242,11 @@ var slashCommandPattern = regexp.MustCompile(`^/(\w[\w-]*)\s*(.*)$`)
 // client-side (already expanded before sending) so they pass through.
 // Unknown /commands pass through as literal text.
 func (s *Server) resolveSlashCommands(r *http.Request, messages []Message) []Message {
+	// Nothing to resolve unless at least one user message looks like a command.
+	if !hasSlashCandidate(messages) {
+		return messages
+	}
+
 	// Fetch the MCP prompt list once for this request.
 	prompts, err := s.cfg.Host.ListPrompts(r.Context())
 	if err != nil || len(prompts) == 0 {
