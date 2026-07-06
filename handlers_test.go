@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeHost is a minimal Host used by handler tests. Methods are overridden
@@ -144,6 +145,40 @@ func TestHandleChatStreams(t *testing.T) {
 	if !strings.Contains(payload, "Hello, ") || !strings.Contains(payload, "world!") {
 		t.Fatalf("missing delta content: %s", payload)
 	}
+}
+
+// TestHandleChatReturnsOnClientDisconnect verifies the streaming handler stops
+// promptly when the client goes away, even if host.Complete ignores ctx and
+// would otherwise block forever.
+func TestHandleChatReturnsOnClientDisconnect(t *testing.T) {
+	release := make(chan struct{})
+	host := &fakeHost{
+		complete: func(ctx context.Context, req CompleteRequest, events chan<- Event) error {
+			<-release // deliberately ignore ctx to simulate a slow host
+			return nil
+		},
+	}
+	s := newTestServer(t, host)
+
+	body := `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/chat/api/chat", strings.NewReader(body))
+	ctx, cancel := context.WithCancel(req.Context())
+	req = req.WithContext(ctx)
+
+	done := make(chan struct{})
+	go func() {
+		s.handleChat(httptest.NewRecorder(), req)
+		close(done)
+	}()
+
+	cancel()
+	select {
+	case <-done:
+		// handler returned on disconnect
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleChat did not return after client context was cancelled")
+	}
+	close(release) // let the host goroutine exit
 }
 
 func TestHandleChatEmitsToolCalls(t *testing.T) {

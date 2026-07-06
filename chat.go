@@ -129,14 +129,27 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		close(events)
 	}()
 
-	for ev := range events {
-		data, _ := json.Marshal(ev)
-		w.Write([]byte("data: "))
-		w.Write(data)
-		w.Write([]byte("\n\n"))
-		flusher.Flush()
+	for {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				goto finished
+			}
+			data, _ := json.Marshal(ev)
+			w.Write([]byte("data: "))
+			w.Write(data)
+			w.Write([]byte("\n\n"))
+			flusher.Flush()
+		case <-r.Context().Done():
+			// Client went away. Stop streaming rather than relying solely on
+			// host.Complete noticing — host.Complete receives the same context,
+			// so the goroutine winds down on its own (done is buffered, so its
+			// send never blocks).
+			return
+		}
 	}
 
+finished:
 	if err := <-done; err != nil {
 		data, _ := json.Marshal(Event{Type: EventError, Error: err.Error()})
 		w.Write([]byte("data: "))
