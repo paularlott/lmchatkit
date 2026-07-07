@@ -321,6 +321,7 @@ function webchat({ prefix, browserOnly = false }) {
     // Which message index was just copied to clipboard (-1 = none).
     // Shows a checkmark on the copied message for 2 seconds.
     copiedIdx: -1,
+    copiedHtmlIdx: -1,
 
     // Delete confirmation modal state.
     showDeleteChatModal: false,
@@ -2210,6 +2211,31 @@ function webchat({ prefix, browserOnly = false }) {
         this.copiedIdx = idx;
         setTimeout(() => { if (this.copiedIdx === idx) this.copiedIdx = -1; }, 2000);
       }).catch(() => {});
+    },
+
+    copyMessageHtml(idx, content) {
+      if (!content) return;
+      const html = this.formatContent(content);
+      const container = document.createElement('div');
+      container.innerHTML = html;
+      container.style.position = 'fixed';
+      container.style.left = '-9999px';
+      container.style.top = '0';
+      document.body.appendChild(container);
+      const range = document.createRange();
+      range.selectNodeContents(container);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      try {
+        document.execCommand('copy');
+        this.copiedHtmlIdx = idx;
+        setTimeout(() => { if (this.copiedHtmlIdx === idx) this.copiedHtmlIdx = -1; }, 2000);
+      } catch (e) {
+        this.copyMessage(idx, content);
+      }
+      sel.removeAllRanges();
+      document.body.removeChild(container);
     },
   };
 }
