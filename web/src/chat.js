@@ -919,13 +919,13 @@ function webchat({ prefix, browserOnly = false }) {
 
     // -- persona helpers ---------------------------------------------------
     get currentPersonaName() {
-      const c = this.current();
+      const c = this.current;
       if (!c) return "";
       const p = this.personas.find((x) => x.id === (c.persona_id || c.personaId));
       return p ? p.name : "Default";
     },
     get currentModel() {
-      const c = this.current();
+      const c = this.current;
       return c ? c.model : "";
     },
 
@@ -962,7 +962,7 @@ function webchat({ prefix, browserOnly = false }) {
       }));
       sessionStorage.setItem("webchat:conversations", JSON.stringify(cleaned));
     },
-    current() { return this.conversations.find((c) => c.id === this.currentId); },
+    get current() { return this.conversations.find((c) => c.id === this.currentId); },
 
     // -- new chat setup: searchable persona + model pickers -------------
 
@@ -1301,7 +1301,7 @@ function webchat({ prefix, browserOnly = false }) {
     },
 
     persist() {
-      const c = this.current();
+      const c = this.current;
       if (!c) return;
       if (this._serverMode) {
         const conv = {
@@ -1493,7 +1493,7 @@ function webchat({ prefix, browserOnly = false }) {
       const msg = { id: "msg-" + (++_msgSeq), role: "user", content: draft };
       this.messages.push(msg);
       this.draft = "";
-      const c = this.current();
+      const c = this.current;
       if (c && c.title === "New conversation") {
         c.title = draft.slice(0, 50);
       }
@@ -1563,8 +1563,8 @@ function webchat({ prefix, browserOnly = false }) {
       // treat the rest of the message (or the next message) as code.
       let openCodeFences = 0;
       try {
-        const persona = this.personas.find((p) => p.id === this.current()?.persona_id);
-        const params = this.current()?.params || (persona && persona.params) || {};
+        const persona = this.personas.find((p) => p.id === this.current?.persona_id);
+        const params = this.current?.params || (persona && persona.params) || {};
 
         this.abortController = new AbortController();
 
@@ -1573,7 +1573,7 @@ function webchat({ prefix, browserOnly = false }) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             model: this.currentModel,
-            persona_id: this.current()?.persona_id || "",
+            persona_id: this.current?.persona_id || "",
             messages: this.messages.slice(0, -1),
             params,
           }),
@@ -1801,7 +1801,7 @@ function webchat({ prefix, browserOnly = false }) {
             model: this.currentModel,
             messages: compactMessages,
             tools: [],
-            params: this.current()?.params || {},
+            params: this.current?.params || {},
           }),
           signal: this.abortController.signal,
         });
