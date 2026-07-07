@@ -1,0 +1,12 @@
+{
+  "name": "webchat-assets",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Build pipeline for webchat's embedded chat.js (minified via vite before go:embed).",
+  "scripts": {
+    "build": "vite build"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}

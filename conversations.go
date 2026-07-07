@@ -70,19 +70,26 @@ func (s *Server) handleConversation(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 
 	case http.MethodPatch:
-		// PATCH updates the title only (the only field that makes sense
-		// for a partial update). Reads the existing conversation, changes
-		// the title, saves it back. Broadcasts "conversation_renamed" so
+		// PATCH updates metadata only — title (required) plus any of model,
+		// persona_id and params. Reads the existing conversation, applies
+		// the changes, saves it back. Broadcasts "conversation_renamed" so
 		// other tabs refresh the sidebar without marking the chat unread
-		// (a title change is not new content).
+		// (a metadata change is not new content). Model and persona_id are
+		// ignored when empty (a chat always needs both); params is replaced
+		// wholesale when the field is present in the JSON (including an
+		// empty object).
 		var patch struct {
-			Title string `json:"title"`
+			Title     string                 `json:"title"`
+			Model     string                 `json:"model"`
+			PersonaID string                 `json:"persona_id"`
+			Params    map[string]interface{} `json:"params"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid body")
 			return
 		}
-		if strings.TrimSpace(patch.Title) == "" {
+		title := strings.TrimSpace(patch.Title)
+		if title == "" {
 			writeError(w, http.StatusBadRequest, "title is required")
 			return
 		}
@@ -91,7 +98,16 @@ func (s *Server) handleConversation(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
-		conv.Title = strings.TrimSpace(patch.Title)
+		conv.Title = title
+		if m := strings.TrimSpace(patch.Model); m != "" {
+			conv.Model = m
+		}
+		if p := strings.TrimSpace(patch.PersonaID); p != "" {
+			conv.PersonaID = p
+		}
+		if patch.Params != nil {
+			conv.Params = patch.Params
+		}
 		if err := s.cfg.History.Save(r.Context(), conv); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return

@@ -150,33 +150,37 @@ func (s *Server) Mount(mux *http.ServeMux) {
 		}
 	}
 
-	// API
-	mux.HandleFunc(prefix+"/api/personas", wrapf(s.handlePersonas))
-	mux.HandleFunc(prefix+"/api/commands", wrapf(s.handleCommands))
-	mux.HandleFunc(prefix+"/api/models", wrapf(s.handleModels))
-	mux.HandleFunc(prefix+"/api/chat", wrapf(s.handleChat))
-	mux.HandleFunc(prefix+"/api/tools/call", wrapf(s.handleCallTool))
-	mux.HandleFunc(prefix+"/api/prompts", wrapf(s.handleListPrompts))
-	mux.HandleFunc(prefix+"/api/prompts/get", wrapf(s.handleGetPrompt))
-	mux.HandleFunc(prefix+"/api/resources", wrapf(s.handleListResources))
-	mux.HandleFunc(prefix+"/api/resources/read", wrapf(s.handleReadResource))
+	// API — method-specific patterns avoid conflicts with host catch-all
+	// routes (e.g. Go 1.22+ ServeMux "GET /" matches every path on GET,
+	// which conflicts with method-agnostic patterns on the same path).
+	mux.HandleFunc("GET "+prefix+"/api/personas", wrapf(s.handlePersonas))
+	mux.HandleFunc("GET "+prefix+"/api/commands", wrapf(s.handleCommands))
+	mux.HandleFunc("GET "+prefix+"/api/models", wrapf(s.handleModels))
+	mux.HandleFunc("POST "+prefix+"/api/chat", wrapf(s.handleChat))
+	mux.HandleFunc("POST "+prefix+"/api/tools/call", wrapf(s.handleCallTool))
+	mux.HandleFunc("GET "+prefix+"/api/prompts", wrapf(s.handleListPrompts))
+	mux.HandleFunc("POST "+prefix+"/api/prompts/get", wrapf(s.handleGetPrompt))
+	mux.HandleFunc("GET "+prefix+"/api/resources", wrapf(s.handleListResources))
+	mux.HandleFunc("POST "+prefix+"/api/resources/read", wrapf(s.handleReadResource))
 
 	// Static assets (chat.js, chat.css, markdown.js bundles).
-	mux.HandleFunc(prefix+"/assets/", wrapf(s.handleAsset))
+	mux.HandleFunc("GET "+prefix+"/assets/", wrapf(s.handleAsset))
 
 	// Conversation CRUD — only mounted when a HistoryStore is configured.
 	if s.cfg.History != nil {
-		mux.HandleFunc(prefix+"/api/conversations", wrapf(s.handleConversations))
-		mux.HandleFunc(prefix+"/api/conversations/", wrapf(s.handleConversation))
+		mux.HandleFunc("GET "+prefix+"/api/conversations", wrapf(s.handleConversations))
+		mux.HandleFunc("GET "+prefix+"/api/conversations/", wrapf(s.handleConversation))
+		mux.HandleFunc("PUT "+prefix+"/api/conversations/", wrapf(s.handleConversation))
+		mux.HandleFunc("DELETE "+prefix+"/api/conversations/", wrapf(s.handleConversation))
 	}
 
 	// SSE event stream — only mounted when an EventBroadcaster is configured.
 	if s.cfg.Events != nil {
-		mux.HandleFunc(prefix+"/api/events", wrapf(s.handleEvents))
+		mux.HandleFunc("GET "+prefix+"/api/events", wrapf(s.handleEvents))
 	}
 }
 
-//go:embed web/src/chat.js
+//go:embed web/dist/chat.js
 var assetsFS embed.FS
 
 // AssetFS exposes the bundled chat.js so hosts can serve it from their

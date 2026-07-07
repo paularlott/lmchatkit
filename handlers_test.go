@@ -243,22 +243,25 @@ func TestMountRegistersRoutes(t *testing.T) {
 	// webchat owns API + assets routes. The host owns the page itself
 	// (so it lives in the host's template tree where Tailwind can scan
 	// it); we deliberately do NOT register /chat here.
-	for _, p := range []string{
-		"/chat/api/personas",
-		"/chat/api/commands",
-		"/chat/api/models",
-		"/chat/api/chat",
-		"/chat/api/tools/call",
-		"/chat/api/prompts",
-		"/chat/api/prompts/get",
-		"/chat/api/resources",
-		"/chat/api/resources/read",
-		"/chat/assets/chat.js",
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/chat/api/personas"},
+		{http.MethodGet, "/chat/api/commands"},
+		{http.MethodGet, "/chat/api/models"},
+		{http.MethodPost, "/chat/api/chat"},
+		{http.MethodPost, "/chat/api/tools/call"},
+		{http.MethodGet, "/chat/api/prompts"},
+		{http.MethodPost, "/chat/api/prompts/get"},
+		{http.MethodGet, "/chat/api/resources"},
+		{http.MethodPost, "/chat/api/resources/read"},
+		{http.MethodGet, "/chat/assets/chat.js"},
 	} {
-		req := httptest.NewRequest(http.MethodGet, p, nil)
+		req := httptest.NewRequest(tc.method, tc.path, nil)
 		_, pattern := mux.Handler(req)
 		if pattern == "" {
-			t.Errorf("no handler registered for %s", p)
+			t.Errorf("no handler registered for %s %s", tc.method, tc.path)
 		}
 	}
 }

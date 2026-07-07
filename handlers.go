@@ -174,7 +174,7 @@ func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	data, err := assetsFS.ReadFile("web/src/" + rel)
+	data, err := assetsFS.ReadFile("web/dist/" + rel)
 	if err != nil {
 		http.NotFound(w, r)
 		return

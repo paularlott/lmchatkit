@@ -279,7 +279,7 @@ if (window.Alpine && typeof window.Alpine.data === "function") {
   });
 }
 
-function webchat({ prefix }) {
+function webchat({ prefix, browserOnly = false }) {
   let _msgSeq = 0;
   return {
     prefix,
@@ -292,7 +292,6 @@ function webchat({ prefix }) {
     messages: [],
     streaming: false,
     draft: "",
-    commandHint: "",
 
     // Slash command autocomplete dropdown. When draft starts with "/"
     // (and no space yet), we show a filtered list of commands. Arrow
@@ -372,6 +371,31 @@ function webchat({ prefix }) {
     setupPersonaIndex: 0,
     setupModelOpen: false,
     setupModelIndex: 0,
+
+    // Edit-conversation modal state. Opened from the sidebar pencil button;
+    // mirrors the new-chat setup screen so an existing chat's persona, model
+    // and params can all be changed without starting over. Replaces the older
+    // inline rename flow, which is kept below for hosts that still use it in
+    // their own templates.
+    showEditModal: false,
+    editConvId: null,
+    editTitle: "",
+    editModel: "",
+    editModelSearch: "",
+    editModelOpen: false,
+    editModelIndex: 0,
+    editPersonaId: "default",
+    editPersonaSearch: "",
+    editPersonaOpen: false,
+    editPersonaIndex: 0,
+    editParams: {
+      temperature: null,
+      top_p: null,
+      top_k: null,
+      repeat_penalty: null,
+      context_length: null,
+      max_tokens: null,
+    },
     // Model parameters — populated from the selected persona's [params],
     // user can override any field. null = use API default. Stored on the
     // conversation at startChat() so subsequent turns use the same values.
@@ -390,6 +414,26 @@ function webchat({ prefix }) {
     // for a tool, that tool is auto-approved in every chat for the rest of
     // the session.
     autoAllowTools: [],
+
+    // --- Sidebar toggle (conversation history list) ---
+    // Hosts that render a collapsible sidebar (e.g. knot's floating window)
+    // bind this to a toggle button. Full-page hosts can leave it true.
+    showSidebar: false,
+
+    // --- Floating-window state (optional) ---
+    // When a host renders the chat as a floating, draggable, resizable
+    // window (e.g. knot's floating panel), these properties track position,
+    // size, and drag/resize interactions. They persist to localStorage so
+    // the window opens where the user last left it. Hosts that render the
+    // chat as a full page (e.g. llmrouter) simply ignore these — the
+    // bindings are only active when the host template wires them up.
+    winPos: { x: null, y: null },
+    winSize: { w: null, h: null },
+    winMaximized: false,
+    _dragging: false,
+    _dragOffset: { x: 0, y: 0 },
+    _resizing: null, // null | "se" | "sw" | "ne" | "nw" | "e" | "w" | "n" | "s"
+    _resizeStart: null,
 
     init() {
       // Detect server-side history mode first — determines whether
@@ -443,9 +487,147 @@ function webchat({ prefix }) {
       ["webchat:conversations", "webchat:currentId", "webchat:inputHistory"].forEach((k) => {
         try { localStorage.removeItem(k); } catch {}
       });
+
+      // Restore saved floating-window position/size (if any).
+      try {
+        const saved = JSON.parse(localStorage.getItem("webchat:winGeo") || "{}");
+        if (saved.pos) this.winPos = { ...this.winPos, ...saved.pos };
+        if (saved.size) this.winSize = { ...this.winSize, ...saved.size };
+        if (saved.maximized) this.winMaximized = saved.maximized;
+      } catch {}
     },
 
+    // --- Floating-window geometry helpers ---
+    // These are only active when the host template binds them (e.g.
+    // @mousedown="startDrag($event)" on the window header). On a full-page
+    // host like llmrouter they are never called.
+
+    _saveWinGeo() {
+      try {
+        localStorage.setItem("webchat:winGeo", JSON.stringify({
+          pos: this.winPos,
+          size: this.winSize,
+          maximized: this.winMaximized,
+        }));
+      } catch {}
+    },
+
+    winStyle() {
+      if (this.winMaximized) {
+        return "left:0; top:0; right:0; bottom:0; width:100vw; height:100vh;";
+      }
+      const parts = [];
+      if (this.winPos.x != null) parts.push(`left:${this.winPos.x}px`);
+      if (this.winPos.y != null) parts.push(`top:${this.winPos.y}px`);
+      if (this.winSize.w != null) parts.push(`width:${this.winSize.w}px`);
+      if (this.winSize.h != null) parts.push(`height:${this.winSize.h}px`);
+      return parts.join(";");
+    },
+
+    startDrag(e) {
+      if (this.winMaximized) return;
+      // Only start on left mouse button, and not when clicking interactive
+      // elements inside the header (buttons, inputs).
+      if (e.button !== 0) return;
+      const target = e.target.closest("button, input, select, a, [data-no-drag]");
+      if (target) return;
+      e.preventDefault();
+      const panel = e.currentTarget.closest("[data-chat-window]");
+      if (!panel) return;
+      const rect = panel.getBoundingClientRect();
+      this._dragging = true;
+      this._dragOffset = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+      document.body.style.userSelect = "none";
+      const move = (ev) => this.onDrag(ev);
+      const up = () => {
+        this._dragging = false;
+        document.body.style.userSelect = "";
+        document.removeEventListener("mousemove", move);
+        document.removeEventListener("mouseup", up);
+        this._saveWinGeo();
+      };
+      document.addEventListener("mousemove", move);
+      document.addEventListener("mouseup", up);
+    },
+
+    onDrag(e) {
+      if (!this._dragging) return;
+      const x = e.clientX - this._dragOffset.x;
+      const y = e.clientY - this._dragOffset.y;
+      // Keep the header on-screen (at least 40px visible).
+      const maxX = window.innerWidth - 80;
+      const maxY = window.innerHeight - 80;
+      this.winPos = {
+        x: Math.max(-Math.abs(this.winSize.w || 400) + 120, Math.min(x, maxX)),
+        y: Math.max(0, Math.min(y, maxY)),
+      };
+    },
+
+    startResize(e, dir) {
+      if (this.winMaximized) return;
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const panel = e.currentTarget.closest("[data-chat-window]");
+      if (!panel) return;
+      const rect = panel.getBoundingClientRect();
+      this._resizing = dir;
+      this._resizeStart = {
+        mx: e.clientX,
+        my: e.clientY,
+        x: rect.left,
+        y: rect.top,
+        w: rect.width,
+        h: rect.height,
+      };
+      document.body.style.userSelect = "none";
+      const move = (ev) => this.onResize(ev);
+      const up = () => {
+        this._resizing = null;
+        document.body.style.userSelect = "";
+        document.removeEventListener("mousemove", move);
+        document.removeEventListener("mouseup", up);
+        this._saveWinGeo();
+      };
+      document.addEventListener("mousemove", move);
+      document.addEventListener("mouseup", up);
+    },
+
+    onResize(e) {
+      if (!this._resizing || !this._resizeStart) return;
+      const s = this._resizeStart;
+      const dx = e.clientX - s.mx;
+      const dy = e.clientY - s.my;
+      const dir = this._resizing;
+      const minW = 320, minH = 240;
+
+      let w = s.w, h = s.h, x = s.x, y = s.y;
+      if (dir.includes("e")) w = Math.max(minW, s.w + dx);
+      if (dir.includes("s")) h = Math.max(minH, s.h + dy);
+      if (dir.includes("w")) { w = Math.max(minW, s.w - dx); x = s.x + (s.w - w); }
+      if (dir.includes("n")) { h = Math.max(minH, s.h - dy); y = s.y + (s.h - h); }
+
+      this.winSize = { w, h };
+      this.winPos = { x, y };
+    },
+
+    toggleMaximize() {
+      this.winMaximized = !this.winMaximized;
+      this._saveWinGeo();
+    },
+
+    _browserOnly: browserOnly,
+
     async detectServerMode() {
+      if (this._browserOnly) {
+        this._serverMode = false;
+        this.conversations = this.readStorage();
+        const savedId = sessionStorage.getItem("webchat:currentId") || "";
+        if (savedId && this.conversations.some((c) => c.id === savedId)) {
+          this.loadConversation(savedId);
+        }
+        return;
+      }
       try {
         const r = await fetch(`${this.prefix}/api/conversations`);
         if (r.ok) {
@@ -529,6 +711,7 @@ function webchat({ prefix }) {
               break;
             case "prompts_changed": this.loadPrompts(); break;
             case "resources_changed": this.loadResources(); break;
+            case "personas_changed": this.loadPersonas(); break;
           }
         } catch {}
       };
@@ -562,13 +745,39 @@ function webchat({ prefix }) {
     // System messages are stripped — the server derives the system prompt
     // from the persona on each /api/chat request.
     normalizeMessages(msgs) {
-      return (msgs || [])
+      const out = (msgs || [])
         .filter((m) => m.role !== "system")
         .map((m) => ({
           ...m,
           id: m.id || ("msg-" + (++_msgSeq)),
           tool_calls: m.tool_calls || [],
         }));
+      // Advance _msgSeq past any "msg-N" ids carried over from storage so the
+      // fresh ids minted below (and the next locally-created message) can't
+      // collide with a kept one. Without this, a page reload resets the
+      // sequence to 0 and the next send produces msg-1 again — colliding with
+      // the first loaded message. Alpine's x-for dedupes by :key, so the
+      // earlier message stops rendering even though it stays in this.messages
+      // (and is still sent to the model).
+      for (const m of out) {
+        const n = typeof m.id === "string" && m.id.startsWith("msg-")
+          ? parseInt(m.id.slice(4), 10) : NaN;
+        if (!Number.isNaN(n) && n >= _msgSeq) _msgSeq = n;
+      }
+      // De-duplicate: a conversation saved while the sequencing bug above was
+      // active can carry duplicate "msg-N" ids on disk (e.g. two msg-1). On
+      // load that makes Alpine drop all but one colliding message from the
+      // rendered transcript. Give any collided id a fresh, guaranteed-unique
+      // sequence number so the full history renders again. This also repairs
+      // the stored conversation the next time it's persisted.
+      const seen = new Set();
+      for (const m of out) {
+        if (seen.has(m.id)) {
+          m.id = "msg-" + (++_msgSeq);
+        }
+        seen.add(m.id);
+      }
+      return out;
     },
 
     // reloadCurrentConversation fetches the conversation we're currently
@@ -818,6 +1027,147 @@ function webchat({ prefix }) {
       else if (e.key === "ArrowUp") { e.preventDefault(); this.setupModelIndex = Math.max(0, this.setupModelIndex - 1); }
       else if (e.key === "Enter") { e.preventDefault(); const m = matches[this.setupModelIndex]; if (m) this.selectSetupModel(m); }
       else if (e.key === "Escape") { this.setupModelOpen = false; }
+    },
+
+    // -- edit conversation modal (title + persona + model + params) -------
+    // Opened from the sidebar pencil button. Mirrors the new-chat setup
+    // screen so any metadata of an existing chat can be changed without
+    // starting over. Saving PATCHes {title, persona_id, model, params}; if
+    // the edited conversation is the one currently open, its fields update
+    // live (currentModel / currentPersonaName read through current()) so the
+    // next send uses them.
+
+    openEdit(c) {
+      this.editConvId = c.id;
+      this.editTitle = c.title || "";
+      this.editModel = c.model || "";
+      this.editPersonaId = c.persona_id || "default";
+      this.editModelSearch = "";
+      this.editModelOpen = false;
+      this.editModelIndex = 0;
+      this.editPersonaSearch = "";
+      this.editPersonaOpen = false;
+      this.editPersonaIndex = 0;
+      // Seed param fields with the conversation's current params. Missing
+      // keys stay null (= "use API default"), matching the setup screen.
+      const cp = c.params || {};
+      this.editParams = {
+        temperature: cp.temperature != null ? cp.temperature : null,
+        top_p: cp.top_p != null ? cp.top_p : null,
+        top_k: cp.top_k != null ? cp.top_k : null,
+        repeat_penalty: cp.repeat_penalty != null ? cp.repeat_penalty : null,
+        context_length: cp.context_length != null ? cp.context_length : null,
+        max_tokens: cp.max_tokens != null ? cp.max_tokens : null,
+      };
+      this.showEditModal = true;
+    },
+
+    get editPersonaMatches() {
+      const s = this.editPersonaSearch.toLowerCase().trim();
+      if (!s) return this.personas;
+      return this.personas.filter((p) =>
+        p.name.toLowerCase().includes(s) ||
+        (p.description || "").toLowerCase().includes(s)
+      );
+    },
+
+    get editModelMatches() {
+      const s = this.editModelSearch.toLowerCase().trim();
+      if (!s) return this.models;
+      return this.models.filter((m) =>
+        m.id.toLowerCase().includes(s) ||
+        (m.provider || "").toLowerCase().includes(s)
+      );
+    },
+
+    selectEditPersona(p) {
+      this.editPersonaId = p.id;
+      this.editPersonaOpen = false;
+      this.editPersonaSearch = "";
+      // Same behaviour as the setup screen: adopt the persona's default
+      // model (if any) and seed the param fields from its [params] table,
+      // so editing mirrors creating a conversation against that persona.
+      if (p.default_model && this.models.some((m) => m.id === p.default_model)) {
+        this.editModel = p.default_model;
+        this.editModelSearch = "";
+      }
+      const pp = p.params || {};
+      this.editParams = {
+        temperature: pp.temperature != null ? pp.temperature : null,
+        top_p: pp.top_p != null ? pp.top_p : null,
+        top_k: pp.top_k != null ? pp.top_k : null,
+        repeat_penalty: pp.repeat_penalty != null ? pp.repeat_penalty : null,
+        context_length: pp.context_length != null ? pp.context_length : null,
+        max_tokens: pp.max_tokens != null ? pp.max_tokens : null,
+      };
+    },
+
+    selectEditModel(m) {
+      this.editModel = m.id;
+      this.editModelOpen = false;
+      this.editModelSearch = "";
+    },
+
+    onEditPersonaKeydown(e) {
+      if (!this.editPersonaOpen) return;
+      const matches = this.editPersonaMatches;
+      if (e.key === "ArrowDown") { e.preventDefault(); this.editPersonaIndex = Math.min(matches.length - 1, this.editPersonaIndex + 1); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); this.editPersonaIndex = Math.max(0, this.editPersonaIndex - 1); }
+      else if (e.key === "Enter") { e.preventDefault(); const p = matches[this.editPersonaIndex]; if (p) this.selectEditPersona(p); }
+      else if (e.key === "Escape") { this.editPersonaOpen = false; }
+    },
+
+    onEditModelKeydown(e) {
+      if (!this.editModelOpen) return;
+      const matches = this.editModelMatches;
+      if (e.key === "ArrowDown") { e.preventDefault(); this.editModelIndex = Math.min(matches.length - 1, this.editModelIndex + 1); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); this.editModelIndex = Math.max(0, this.editModelIndex - 1); }
+      else if (e.key === "Enter") { e.preventDefault(); const m = matches[this.editModelIndex]; if (m) this.selectEditModel(m); }
+      else if (e.key === "Escape") { this.editModelOpen = false; }
+    },
+
+    // editEffectiveParams drops null/empty fields from editParams so we don't
+    // persist no-op overrides — same convention as the setup screen.
+    get editEffectiveParams() {
+      const out = {};
+      for (const [k, v] of Object.entries(this.editParams)) {
+        if (v !== null && v !== "" && v !== undefined && !Number.isNaN(v)) {
+          out[k] = typeof v === "string" ? parseFloat(v) : v;
+        }
+      }
+      return out;
+    },
+
+    async saveEdit() {
+      const title = (this.editTitle || "").trim();
+      if (!title) return; // server requires a non-empty title
+      const id = this.editConvId;
+      const model = (this.editModel || "").trim();
+      const personaId = (this.editPersonaId || "").trim();
+      const params = this.editEffectiveParams;
+      // Optimistic local update so the sidebar title + the active chat's
+      // persona/model/params reflect immediately. currentPersonaName and
+      // currentModel read through current(), and streamTurn pulls params
+      // from current().params — so updating the conversation object is
+      // enough for the next send to pick up the new values.
+      const conv = this.conversations.find((c) => c.id === id);
+      if (conv) {
+        conv.title = title;
+        if (model) conv.model = model;
+        if (personaId) conv.persona_id = personaId;
+        conv.params = params;
+      }
+      if (this._serverMode) {
+        fetch(`${this.prefix}/api/conversations/${id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title, model, persona_id: personaId, params }),
+        }).catch(() => {});
+      } else {
+        this.writeStorage();
+      }
+      this.showEditModal = false;
+      this.editConvId = null;
     },
 
     // Build the effective params map for the conversation: start with persona
