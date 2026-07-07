@@ -2130,7 +2130,7 @@ function webchat({ prefix, browserOnly = false }) {
           }
           sessionStorage.setItem("webchat:autoAllow", JSON.stringify(this.autoAllowTools));
         }
-        const rendered = (cmd.body || "").replaceAll("$ARGUMENTS", args);
+        const rendered = (cmd.body || "").replaceAll("$ARGUMENTS", args).trim();
         this.messages.push({ id: "msg-" + (++_msgSeq), role: "user", content: rendered });
         this.scrollToBottom();
         this.persist();
