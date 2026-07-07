@@ -627,6 +627,7 @@ function webchat({ prefix, browserOnly = false }) {
         if (savedId && this.conversations.some((c) => c.id === savedId)) {
           this.loadConversation(savedId);
         }
+        this.subscribeToEvents();
         return;
       }
       try {
@@ -713,6 +714,7 @@ function webchat({ prefix, browserOnly = false }) {
             case "prompts_changed": this.loadPrompts(); break;
             case "resources_changed": this.loadResources(); break;
             case "personas_changed": this.loadPersonas(); break;
+            case "commands_changed": this.loadCommands(); break;
           }
         } catch {}
       };
