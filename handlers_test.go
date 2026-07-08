@@ -1,4 +1,4 @@
-package webchat
+package lmchatkit
 
 import (
 	"context"
@@ -54,7 +54,7 @@ func (h *fakeHost) ReadResource(ctx context.Context, uri string) (ResourceResult
 	return h.readResource(ctx, uri)
 }
 
-// newTestServer wires a webchat Server with no on-disk persona/command dirs.
+// newTestServer wires a lmchatkit Server with no on-disk persona/command dirs.
 func newTestServer(t *testing.T, host Host) *Server {
 	t.Helper()
 	s, err := New(Config{
@@ -240,7 +240,7 @@ func TestMountRegistersRoutes(t *testing.T) {
 	mux := http.NewServeMux()
 	s.Mount(mux)
 
-	// webchat owns API + assets routes. The host owns the page itself
+	// lmchatkit owns API + assets routes. The host owns the page itself
 	// (so it lives in the host's template tree where Tailwind can scan
 	// it); we deliberately do NOT register /chat here.
 	for _, tc := range []struct {

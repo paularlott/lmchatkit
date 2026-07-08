@@ -1,4 +1,4 @@
-package webchat
+package lmchatkit
 
 import (
 	"embed"
@@ -8,10 +8,10 @@ import (
 
 // Config configures a [Server] at mount time.
 type Config struct {
-	// Prefix is the URL prefix webchat mounts under, e.g. "/chat". Must be
+	// Prefix is the URL prefix lmchatkit mounts under, e.g. "/chat". Must be
 	// non-empty. Routes are registered as Prefix+"/api/..." and
 	// Prefix+"/assets/...". The host owns the Prefix page route itself —
-	// see webchat/examples/chat.html.
+	// see lmchatkit/examples/chat.html.
 	Prefix string
 
 	// PersonasDir is the directory scanned for persona TOML files. Empty
@@ -34,11 +34,11 @@ type Config struct {
 	// CommandSource overrides CommandsDir. Same contract as PersonaSource.
 	CommandSource CommandSource
 
-	// Host is the contract between webchat and the embedding application.
+	// Host is the contract between lmchatkit and the embedding application.
 	// Must be non-nil.
 	Host Host
 
-	// AuthMiddleware wraps every webchat HTTP handler. It is the host's
+	// AuthMiddleware wraps every lmchatkit HTTP handler. It is the host's
 	// responsibility to enforce authentication, sessions, rate limiting, etc.
 	// nil means no auth (rare; only appropriate for fully internal hosts).
 	AuthMiddleware func(http.Handler) http.Handler
@@ -118,7 +118,7 @@ func (s *Server) Close() {
 }
 
 // ErrMissingHost is returned by [New] when Config.Host is nil.
-var ErrMissingHost = errString("webchat: Config.Host is required")
+var ErrMissingHost = errString("lmchatkit: Config.Host is required")
 
 // errString is a tiny error type so we get a sentinel with a stable message
 // without pulling in fmt or errors just for one declaration.
@@ -126,12 +126,12 @@ type errString string
 
 func (e errString) Error() string { return string(e) }
 
-// Mount registers webchat's API and asset routes on mux under the
+// Mount registers lmchatkit's API and asset routes on mux under the
 // configured prefix. It deliberately does NOT register a page route —
 // the host owns the chat page template (so it lives in the host's
 // source tree where Tailwind can scan it). Hosts render /chat
 // themselves using the example template shipped at
-// webchat/web/templates/chat.html as a starting point.
+// lmchatkit/examples/chat.html as a starting point.
 //
 // Routes registered:
 //   - {prefix}/api/...   — chat/tools/prompts/resources endpoints
@@ -171,6 +171,7 @@ func (s *Server) Mount(mux *http.ServeMux) {
 		mux.HandleFunc("GET "+prefix+"/api/conversations", wrapf(s.handleConversations))
 		mux.HandleFunc("GET "+prefix+"/api/conversations/", wrapf(s.handleConversation))
 		mux.HandleFunc("PUT "+prefix+"/api/conversations/", wrapf(s.handleConversation))
+		mux.HandleFunc("PATCH "+prefix+"/api/conversations/", wrapf(s.handleConversation))
 		mux.HandleFunc("DELETE "+prefix+"/api/conversations/", wrapf(s.handleConversation))
 	}
 

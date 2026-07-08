@@ -1,13 +1,13 @@
-// Package webchat is a self-contained chat UI + backend protocol that mounts
+// Package lmchatkit is a self-contained chat UI + backend protocol that mounts
 // into any HTTP server. The host implements [Host] to provide an LLM
-// completion stream and (optionally) MCP tools, prompts and resources; webchat
+// completion stream and (optionally) MCP tools, prompts and resources; lmchatkit
 // owns the frontend bundle, the chat session protocol, persona loading and
 // slash-command loading.
 //
 // Routes are mounted under a configurable prefix (typically /chat) via
 // [Server.Mount]. Auth is the host's responsibility — pass an [AuthMiddleware]
-// in [Config] and it wraps every webchat handler.
-package webchat
+// in [Config] and it wraps every lmchatkit handler.
+package lmchatkit
 
 import (
 	"context"
@@ -183,11 +183,11 @@ type Usage struct {
 	TotalTokens      int `json:"total_tokens,omitempty"`
 }
 
-// Host is the contract between webchat and its embedding application. Every
+// Host is the contract between lmchatkit and its embedding application. Every
 // method takes a context so hosts can enforce timeouts / cancellation. Any
-// method may return an error; webchat surfaces it to the user.
+// method may return an error; lmchatkit surfaces it to the user.
 //
-// All methods must be safe for concurrent use: webchat is stateless and a
+// All methods must be safe for concurrent use: lmchatkit is stateless and a
 // single Server may serve many simultaneous chat sessions across many users.
 type Host interface {
 	// Models returns the models the chat user may select from. The list may
@@ -195,7 +195,7 @@ type Host interface {
 	Models(ctx context.Context) ([]Model, error)
 
 	// Complete streams a chat completion for the given request. Implementations
-	// push events onto events (never block on a full channel — webchat's
+	// push events onto events (never block on a full channel — lmchatkit's
 	// channel is buffered) and return when the stream is finished. If the
 	// model emitted tool calls, emit one [EventToolCall] per call and return
 	// with FinishReason == FinishToolCalls — the frontend will execute the

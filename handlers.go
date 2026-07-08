@@ -1,4 +1,4 @@
-package webchat
+package lmchatkit
 
 import (
 	"crypto/sha256"

@@ -1,4 +1,4 @@
-module github.com/paularlott/webchat
+module github.com/paularlott/lmchatkit
 
 go 1.26.1
 

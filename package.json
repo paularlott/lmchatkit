@@ -1,8 +1,8 @@
 {
-  "name": "webchat-assets",
+  "name": "lmchatkit-assets",
   "version": "0.1.0",
   "private": true,
-  "description": "Build pipeline for webchat's embedded chat.js (minified via vite before go:embed).",
+  "description": "Build pipeline for lmchatkit's embedded chat.js (minified via vite before go:embed).",
   "scripts": {
     "build": "vite build"
   },

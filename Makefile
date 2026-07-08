@@ -1,4 +1,4 @@
-# webchat Makefile. The embedded chat.js is minified via vite before
+# lmchatkit Makefile. The embedded chat.js is minified via vite before
 # go:embed picks it up, so consumers of the Go library don't need a JS
 # toolchain — web/dist/chat.js is committed. Rebuild and commit it whenever
 # web/src/chat.js changes.

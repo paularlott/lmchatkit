@@ -16,7 +16,7 @@
     <script defer src="{{.HostJSFile}}"></script>
   </head>
   <body class="min-h-screen bg-slate-100 dark:bg-slate-950 transition-colors duration-300">
-    <div x-data="webchat({ prefix: '{{.Prefix}}' })" x-init="init()" x-cloak>
+    <div x-data="lmchatkit({ prefix: '{{.Prefix}}' })" x-init="init()" x-cloak>
       <!-- Top nav — mirrors the admin pages so the chat tab is visually part of the same app. -->
       <header class="sticky top-0 z-40 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 shadow-sm">
         <div class="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
@@ -241,9 +241,9 @@
                             class="flex items-center gap-2 py-2" role="status" aria-label="Loading response">
                          <span class="sr-only">Loading response…</span>
                          <span class="flex space-x-1">
-                           <span class="w-2.5 h-2.5 bg-slate-400 dark:bg-slate-500 rounded-full webchat-bounce"></span>
-                           <span class="w-2.5 h-2.5 bg-slate-400 dark:bg-slate-500 rounded-full webchat-bounce" style="animation-delay: 0.1s"></span>
-                           <span class="w-2.5 h-2.5 bg-slate-400 dark:bg-slate-500 rounded-full webchat-bounce" style="animation-delay: 0.2s"></span>
+                           <span class="w-2.5 h-2.5 bg-slate-400 dark:bg-slate-500 rounded-full lmchatkit-bounce"></span>
+                           <span class="w-2.5 h-2.5 bg-slate-400 dark:bg-slate-500 rounded-full lmchatkit-bounce" style="animation-delay: 0.1s"></span>
+                           <span class="w-2.5 h-2.5 bg-slate-400 dark:bg-slate-500 rounded-full lmchatkit-bounce" style="animation-delay: 0.2s"></span>
                          </span>
                          <span class="text-xs text-slate-400 dark:text-slate-500">thinking…</span>
                        </div>

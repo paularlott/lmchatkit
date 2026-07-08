@@ -1,4 +1,4 @@
-package webchat
+package lmchatkit
 
 import (
 	"context"
@@ -7,9 +7,9 @@ import (
 )
 
 // SkillToolName is the name of the virtual skill-retrieval tool. The
-// webchat__ prefix prevents collisions with local scriptling tools (no
+// lmchatkit__ prefix prevents collisions with local scriptling tools (no
 // prefix) and remote MCP tools (namespace__ prefix).
-const SkillToolName = "webchat__get_skill"
+const SkillToolName = "lmchatkit__get_skill"
 
 // SkillTool is the virtual tool definition appended to the tool list
 // when the host has skill:// resources. It lets the LLM pull in skill
@@ -46,7 +46,7 @@ func (s *Server) hasSkillResources(ctx context.Context) bool {
 	return false
 }
 
-// trySkillToolCall intercepts the webchat__get_skill virtual tool call
+// trySkillToolCall intercepts the lmchatkit__get_skill virtual tool call
 // and routes it to Host.ReadResource. Returns (result, true) if handled,
 // (_, false) if the tool name doesn't match.
 //

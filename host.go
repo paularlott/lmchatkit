@@ -1,4 +1,4 @@
-package webchat
+package lmchatkit
 
 import (
 	"bufio"
@@ -73,7 +73,7 @@ func OpenAIChatRequest(req CompleteRequest) map[string]interface{} {
 }
 
 // TranslateOpenAIStream reads an OpenAI-compatible SSE stream (the response
-// body from POST /v1/chat/completions with stream:true) and emits webchat
+// body from POST /v1/chat/completions with stream:true) and emits lmchatkit
 // events onto the events channel. Handles:
 //   - delta.content → EventDelta
 //   - delta.reasoning_content / delta.reasoning → EventReasoning
@@ -84,7 +84,7 @@ func OpenAIChatRequest(req CompleteRequest) map[string]interface{} {
 //
 // Hosts that loopback to their own OpenAI endpoint can call this directly
 // instead of reimplementing the SSE parsing. The events channel must be
-// buffered (webchat's chat handler uses a 32-slot buffer).
+// buffered (lmchatkit's chat handler uses a 32-slot buffer).
 func TranslateOpenAIStream(ctx context.Context, body io.Reader, events chan<- Event) error {
 	type toolCallAccum struct {
 		ID        string
@@ -175,7 +175,7 @@ func TranslateOpenAIStream(ctx context.Context, body io.Reader, events chan<- Ev
 		return err
 	}
 
-	// Map OpenAI finish_reason → webchat FinishReason.
+	// Map OpenAI finish_reason → lmchatkit FinishReason.
 	finish := FinishStop
 	switch finalReason {
 	case "tool_calls":
@@ -226,7 +226,7 @@ func emit(ctx context.Context, events chan<- Event, ev Event) error {
 // MCP servers) construct a StandardHost with the appropriate functions. Hosts
 // with fundamentally different architectures implement [Host] themselves.
 //
-// Auth is NOT handled here — the host wraps the webchat routes with its own
+// Auth is NOT handled here — the host wraps the lmchatkit routes with its own
 // middleware via [Config.AuthMiddleware], exactly like it protects any other
 // route. StandardHost never sees tokens, sessions, or passwords.
 type StandardHost struct {

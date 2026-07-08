@@ -1,4 +1,4 @@
-// webchat — markdown processor.
+// lmchatkit — markdown processor.
 //
 // Ported from knot's web/src/js/components/chat.js (same author, same
 // licence). Zero-dependency, handles: fenced + inline code with language
@@ -10,7 +10,7 @@
 // HTML inside them is rendered as text, not executed.
 //
 // Globals are exposed on window so chat.js (loaded as a non-module script)
-// can call them without ES imports. This keeps webchat's bundle friendly
+// can call them without ES imports. This keeps lmchatkit's bundle friendly
 // to hosts that don't ship a JS module system.
 
 (function () {
@@ -243,10 +243,10 @@
   window.processMarkdown = processMarkdown;
   window.escapeHtml = escapeHtml;
 })();
-// webchat — Alpine data component for the chat UI.
+// lmchatkit — Alpine data component for the chat UI.
 //
 // This file assumes the host page has already loaded Alpine (window.Alpine)
-// via its own bundle. We register the "webchat" component on alpine:init.
+// via its own bundle. We register the "lmchatkit" component on alpine:init.
 // Hosts mount this script AFTER their main bundle (e.g. via two deferred
 // <script> tags; deferred scripts run in document order).
 //
@@ -260,26 +260,26 @@
 // State machine for a turn:
 //   draft → sending → streaming → done | tool_calls (waiting on user) | error
 //
-// Conversations are stored in sessionStorage under "webchat:conversations".
+// Conversations are stored in sessionStorage under "lmchatkit:conversations".
 // Per-conversation tool state (enabled list + always-allow list) lives in
 // the same record so it survives reloads.
 
-// Register the "webchat" Alpine data component. Must run BEFORE the host's
+// Register the "lmchatkit" Alpine data component. Must run BEFORE the host's
 // Alpine.start() fires alpine:init. We attach a passive alpine:init listener
 // unconditionally — it's a no-op if the event already fired (defensive
 // against hosts that load Alpine before this script). If Alpine happens to
 // already be on window (host loaded us dynamically), register right away.
 if (window.Alpine && typeof window.Alpine.data === "function") {
-  window.Alpine.data("webchat", webchat);
+  window.Alpine.data("lmchatkit", lmchatkit);
 } else {
   document.addEventListener("alpine:init", () => {
     if (window.Alpine && typeof window.Alpine.data === "function") {
-      window.Alpine.data("webchat", webchat);
+      window.Alpine.data("lmchatkit", lmchatkit);
     }
   });
 }
 
-function webchat({ prefix, browserOnly = false }) {
+function lmchatkit({ prefix, browserOnly = false }) {
   let _msgSeq = 0;
   return {
     prefix,
@@ -454,7 +454,7 @@ function webchat({ prefix, browserOnly = false }) {
           this.setupModel = this.models[0].id;
           this.startChat();
         }
-      }).catch((e) => console.warn("webchat init failed", e));
+      }).catch((e) => console.warn("lmchatkit init failed", e));
 
       this.$watch("draft", () => {
         this.autosize();
@@ -470,32 +470,40 @@ function webchat({ prefix, browserOnly = false }) {
       });
 
       try {
-        this.inputHistory = JSON.parse(sessionStorage.getItem("webchat:inputHistory") || "[]");
+        this.inputHistory = JSON.parse(sessionStorage.getItem("lmchatkit:inputHistory") || "[]");
       } catch { this.inputHistory = []; }
 
       try {
-        this.autoAllowTools = JSON.parse(sessionStorage.getItem("webchat:autoAllow") || "[]");
+        this.autoAllowTools = JSON.parse(sessionStorage.getItem("lmchatkit:autoAllow") || "[]");
       } catch { this.autoAllowTools = []; }
 
       // Always auto-approve the virtual skill-retrieval tool — it's a
       // read-only context fetch, not a user-visible action. The model
       // calls it to load skill instructions; the user never needs to
       // approve it.
-      if (!this.autoAllowTools.includes("webchat__get_skill")) {
-        this.autoAllowTools.push("webchat__get_skill");
+      if (!this.autoAllowTools.includes("lmchatkit__get_skill")) {
+        this.autoAllowTools.push("lmchatkit__get_skill");
       }
-
-      ["webchat:conversations", "webchat:currentId", "webchat:inputHistory"].forEach((k) => {
-        try { localStorage.removeItem(k); } catch {}
-      });
 
       // Restore saved floating-window position/size (if any).
       try {
-        const saved = JSON.parse(localStorage.getItem("webchat:winGeo") || "{}");
+        const saved = JSON.parse(localStorage.getItem("lmchatkit:winGeo") || "{}");
         if (saved.pos) this.winPos = { ...this.winPos, ...saved.pos };
         if (saved.size) this.winSize = { ...this.winSize, ...saved.size };
         if (saved.maximized) this.winMaximized = saved.maximized;
       } catch {}
+
+      // When the browser window is resized, forget the chat window's
+      // remembered geometry so it can never end up off-screen. Resetting
+      // to null lets winStyle() recompute a sensible default against the
+      // current viewport (the window tracks the bottom-right corner as
+      // the viewport changes).
+      window.addEventListener("resize", () => {
+        this.winPos = { x: null, y: null };
+        this.winSize = { w: null, h: null };
+        this.winMaximized = false;
+        try { localStorage.removeItem("lmchatkit:winGeo"); } catch {}
+      });
     },
 
     // --- Floating-window geometry helpers ---
@@ -505,7 +513,7 @@ function webchat({ prefix, browserOnly = false }) {
 
     _saveWinGeo() {
       try {
-        localStorage.setItem("webchat:winGeo", JSON.stringify({
+        localStorage.setItem("lmchatkit:winGeo", JSON.stringify({
           pos: this.winPos,
           size: this.winSize,
           maximized: this.winMaximized,
@@ -517,12 +525,15 @@ function webchat({ prefix, browserOnly = false }) {
       if (this.winMaximized) {
         return "left:0; top:0; right:0; bottom:0; width:100vw; height:100vh;";
       }
-      const parts = [];
-      if (this.winPos.x != null) parts.push(`left:${this.winPos.x}px`);
-      if (this.winPos.y != null) parts.push(`top:${this.winPos.y}px`);
-      if (this.winSize.w != null) parts.push(`width:${this.winSize.w}px`);
-      if (this.winSize.h != null) parts.push(`height:${this.winSize.h}px`);
-      return parts.join(";");
+      // Fall back to a sensible bottom-right default (sized to the current
+      // viewport) when no position/size has been set or remembered. This
+      // keeps the window on-screen after geometry is forgotten on a
+      // browser resize instead of collapsing to the top-left corner.
+      const w = this.winSize.w != null ? this.winSize.w : Math.min(480, Math.max(320, window.innerWidth - 40));
+      const h = this.winSize.h != null ? this.winSize.h : Math.min(560, Math.max(240, window.innerHeight - 40));
+      const x = this.winPos.x != null ? this.winPos.x : Math.max(20, window.innerWidth - w - 20);
+      const y = this.winPos.y != null ? this.winPos.y : Math.max(20, window.innerHeight - h - 20);
+      return `left:${x}px; top:${y}px; width:${w}px; height:${h}px;`;
     },
 
     startDrag(e) {
@@ -538,6 +549,8 @@ function webchat({ prefix, browserOnly = false }) {
       const rect = panel.getBoundingClientRect();
       this._dragging = true;
       this._dragOffset = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+      this._dragW = rect.width;
+      this._dragH = rect.height;
       document.body.style.userSelect = "none";
       const move = (ev) => this.onDrag(ev);
       const up = () => {
@@ -555,11 +568,14 @@ function webchat({ prefix, browserOnly = false }) {
       if (!this._dragging) return;
       const x = e.clientX - this._dragOffset.x;
       const y = e.clientY - this._dragOffset.y;
-      // Keep the header on-screen (at least 40px visible).
-      const maxX = window.innerWidth - 80;
-      const maxY = window.innerHeight - 80;
+      // Keep the whole window inside the viewport — it can't be dragged
+      // off the right/bottom edge (nor off the top/left).
+      const w = this._dragW || this.winSize.w || 400;
+      const h = this._dragH || this.winSize.h || 300;
+      const maxX = Math.max(0, window.innerWidth - w);
+      const maxY = Math.max(0, window.innerHeight - h);
       this.winPos = {
-        x: Math.max(-Math.abs(this.winSize.w || 400) + 120, Math.min(x, maxX)),
+        x: Math.max(0, Math.min(x, maxX)),
         y: Math.max(0, Math.min(y, maxY)),
       };
     },
@@ -603,10 +619,12 @@ function webchat({ prefix, browserOnly = false }) {
       const minW = 320, minH = 240;
 
       let w = s.w, h = s.h, x = s.x, y = s.y;
-      if (dir.includes("e")) w = Math.max(minW, s.w + dx);
-      if (dir.includes("s")) h = Math.max(minH, s.h + dy);
-      if (dir.includes("w")) { w = Math.max(minW, s.w - dx); x = s.x + (s.w - w); }
-      if (dir.includes("n")) { h = Math.max(minH, s.h - dy); y = s.y + (s.h - h); }
+      // Constrain each edge to the viewport so the window can't be
+      // resized off-screen on any side.
+      if (dir.includes("e")) w = Math.max(minW, Math.min(window.innerWidth - s.x, s.w + dx));
+      if (dir.includes("s")) h = Math.max(minH, Math.min(window.innerHeight - s.y, s.h + dy));
+      if (dir.includes("w")) { w = Math.max(minW, Math.min(s.x + s.w, s.w - dx)); x = s.x + (s.w - w); }
+      if (dir.includes("n")) { h = Math.max(minH, Math.min(s.y + s.h, s.h - dy)); y = s.y + (s.h - h); }
 
       this.winSize = { w, h };
       this.winPos = { x, y };
@@ -623,7 +641,7 @@ function webchat({ prefix, browserOnly = false }) {
       if (this._browserOnly) {
         this._serverMode = false;
         this.conversations = this.readStorage();
-        const savedId = sessionStorage.getItem("webchat:currentId") || "";
+        const savedId = sessionStorage.getItem("lmchatkit:currentId") || "";
         if (savedId && this.conversations.some((c) => c.id === savedId)) {
           this.loadConversation(savedId);
         }
@@ -637,7 +655,7 @@ function webchat({ prefix, browserOnly = false }) {
           const list = await r.json();
           this.conversations = Array.isArray(list) ? list : [];
           this.subscribeToEvents();
-          const savedId = sessionStorage.getItem("webchat:currentId") || "";
+          const savedId = sessionStorage.getItem("lmchatkit:currentId") || "";
           if (savedId && this.conversations.some((c) => c.id === savedId)) {
             await this.loadConversation(savedId);
           }
@@ -646,7 +664,7 @@ function webchat({ prefix, browserOnly = false }) {
       } catch {}
       this._serverMode = false;
       this.conversations = this.readStorage();
-      const savedId = sessionStorage.getItem("webchat:currentId") || "";
+      const savedId = sessionStorage.getItem("lmchatkit:currentId") || "";
       if (savedId && this.conversations.some((c) => c.id === savedId)) {
         this.loadConversation(savedId);
       }
@@ -945,7 +963,7 @@ function webchat({ prefix, browserOnly = false }) {
     // -- conversation persistence -----------------------------------------
     readStorage() {
       try {
-        return JSON.parse(sessionStorage.getItem("webchat:conversations") || "[]");
+        return JSON.parse(sessionStorage.getItem("lmchatkit:conversations") || "[]");
       } catch { return []; }
     },
     writeStorage() {
@@ -963,7 +981,7 @@ function webchat({ prefix, browserOnly = false }) {
           return copy;
         }),
       }));
-      sessionStorage.setItem("webchat:conversations", JSON.stringify(cleaned));
+      sessionStorage.setItem("lmchatkit:conversations", JSON.stringify(cleaned));
     },
     get current() { return this.conversations.find((c) => c.id === this.currentId); },
 
@@ -1194,7 +1212,7 @@ function webchat({ prefix, browserOnly = false }) {
     newChat() {
       this.currentId = null;
       this.messages = [];
-      sessionStorage.removeItem("webchat:currentId");
+      sessionStorage.removeItem("lmchatkit:currentId");
       // Note: autoAllowTools is NOT reset — "Always Allow" is
       // session-global, not per-chat.
     },
@@ -1217,7 +1235,7 @@ function webchat({ prefix, browserOnly = false }) {
       // system messages.
       this.conversations.unshift(conv);
       this.currentId = id;
-      sessionStorage.setItem("webchat:currentId", id);
+      sessionStorage.setItem("lmchatkit:currentId", id);
       this.messages = conv.messages;
       if (!this._serverMode) {
         // sessionStorage mode needs the full conversation (with messages)
@@ -1228,13 +1246,18 @@ function webchat({ prefix, browserOnly = false }) {
     },
 
     async loadConversation(id) {
+      // Observing a conversation clears its unread indicator (unread is
+      // session-only; this is the only place it's cleared).
+      const observed = this.conversations.find((c) => c.id === id);
+      if (observed) observed.unread = false;
+
       if (this._serverMode) {
         try {
           const r = await fetch(`${this.prefix}/api/conversations/${id}`);
           if (!r.ok) return;
           const data = await r.json();
           this.currentId = id;
-          sessionStorage.setItem("webchat:currentId", id);
+          sessionStorage.setItem("lmchatkit:currentId", id);
           this.messages = this.normalizeMessages(data.messages);
           this.userHasScrolled = false;
           this.scrollToBottom();
@@ -1244,7 +1267,7 @@ function webchat({ prefix, browserOnly = false }) {
         const c = this.conversations.find((x) => x.id === id);
         if (!c) return;
         this.currentId = id;
-        sessionStorage.setItem("webchat:currentId", id);
+        sessionStorage.setItem("lmchatkit:currentId", id);
         this.messages = c.messages;
         this.userHasScrolled = false;
         this.scrollToBottom();
@@ -1279,7 +1302,7 @@ function webchat({ prefix, browserOnly = false }) {
       }
       if (id === this.currentId) {
         this.currentId = null;
-        sessionStorage.removeItem("webchat:currentId");
+        sessionStorage.removeItem("lmchatkit:currentId");
         this.messages = [];
       }
     },
@@ -1532,7 +1555,7 @@ function webchat({ prefix, browserOnly = false }) {
       this.historyIndex = -1;
       this.partialDraft = "";
       try {
-        sessionStorage.setItem("webchat:inputHistory", JSON.stringify(this.inputHistory));
+        sessionStorage.setItem("lmchatkit:inputHistory", JSON.stringify(this.inputHistory));
       } catch {}
     },
 
@@ -1908,7 +1931,7 @@ function webchat({ prefix, browserOnly = false }) {
       if (call.approval !== "pending") return;
       if (always && !this.autoAllowTools.includes(call.name)) {
         this.autoAllowTools.push(call.name);
-        sessionStorage.setItem("webchat:autoAllow", JSON.stringify(this.autoAllowTools));
+        sessionStorage.setItem("lmchatkit:autoAllow", JSON.stringify(this.autoAllowTools));
       }
       call.approval = "approving";
       await this.executeToolCall(call);
@@ -2131,7 +2154,7 @@ function webchat({ prefix, browserOnly = false }) {
               this.autoAllowTools.push(toolName);
             }
           }
-          sessionStorage.setItem("webchat:autoAllow", JSON.stringify(this.autoAllowTools));
+          sessionStorage.setItem("lmchatkit:autoAllow", JSON.stringify(this.autoAllowTools));
         }
         const rendered = (cmd.body || "").replaceAll("$ARGUMENTS", args).trim();
         this.messages.push({ id: "msg-" + (++_msgSeq), role: "user", content: rendered });

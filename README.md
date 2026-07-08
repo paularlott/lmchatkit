@@ -1,6 +1,6 @@
-# webchat
+# LMChatKit
 
-A self-contained chat UI + backend protocol that mounts into any Go HTTP server. The host implements the [`Host`](types.go) interface to provide an LLM completion stream and (optionally) MCP tools, prompts, and resources; **webchat** owns the frontend bundle, the streaming chat protocol, persona loading, and slash-command loading.
+A self-contained chat UI + backend protocol that mounts into any Go HTTP server. The host implements the [`Host`](types.go) interface to provide an LLM completion stream and (optionally) MCP tools, prompts, and resources; **lmchatkit** owns the frontend bundle, the streaming chat protocol, persona loading, and slash-command loading.
 
 Built for — and extracted from — `paularlott/llmrouter`, with the contract shaped so other OpenAI-compatible hosts (e.g. `paularlott/knot`) can mount the same UI without forking it.
 
@@ -11,13 +11,13 @@ Built for — and extracted from — `paularlott/llmrouter`, with the contract s
 - **Slash commands** from a watched markdown directory. `help.md` → `/help`. `$ARGUMENTS` in the body is spliced with whatever the user typed after the command.
 - **MCP pass-through** for tools, prompts, and resources via the `Host` interface — the host decides where they come from.
 - **Tool-call confirmation flow** with per-session auto-allow, persisted in browser `sessionStorage`. The server owns the tool list; the browser only handles approval (Allow / Always Allow / Deny).
-- **Bundles its own HTML/CSS/JS** — the host just calls `Mount(mux)`. The frontend reuses the host's bundled Alpine + Tailwind; webchat doesn't ship a copy.
-- **Auth is host-owned** — pass an `AuthMiddleware` in `Config` and it wraps every webchat handler.
+- **Bundles its own HTML/CSS/JS** — the host just calls `Mount(mux)`. The frontend reuses the host's bundled Alpine + Tailwind; lmchatkit doesn't ship a copy.
+- **Auth is host-owned** — pass an `AuthMiddleware` in `Config` and it wraps every lmchatkit handler.
 
 ## Install
 
 ```
-go get github.com/paularlott/webchat
+go get github.com/paularlott/lmchatkit
 ```
 
 Go 1.26+. The package has three direct dependencies: `fsnotify/fsnotify`, `paularlott/cli`, `paularlott/logger`.
@@ -46,7 +46,7 @@ type Host interface {
 }
 ```
 
-`Host` must be safe for concurrent use — webchat is stateless and one `Server` may serve many simultaneous sessions across many users.
+`Host` must be safe for concurrent use — lmchatkit is stateless and one `Server` may serve many simultaneous sessions across many users.
 
 ### Optional interfaces
 
@@ -85,10 +85,10 @@ The source is consulted on every request, so a DB-backed source always reflects 
 For knot's "one persona, one model, no per-user commands" case:
 
 ```go
-srv, _ := webchat.New(webchat.Config{
+srv, _ := lmchatkit.New(lmchatkit.Config{
     Prefix: "/chat",
     Host:   knotHost,
-    PersonaSource: webchat.StaticPersonas{{
+    PersonaSource: lmchatkit.StaticPersonas{{
         ID: "knot", Name: "Knot", SystemPrompt: knotSystemPrompt, DefaultModel: "knot-1",
     }},
     // CommandsDir / CommandSource left nil — slash commands disabled.
@@ -102,9 +102,9 @@ When the host returns exactly one persona AND one model, the chat UI skips the p
 ## Mount
 
 ```go
-import "github.com/paularlott/webchat"
+import "github.com/paularlott/lmchatkit"
 
-srv, err := webchat.New(webchat.Config{
+srv, err := lmchatkit.New(lmchatkit.Config{
     Prefix:       "/chat",
     PersonasDir:  "/etc/myapp/personas",
     CommandsDir:  "/etc/myapp/commands",
@@ -119,7 +119,7 @@ srv, err := webchat.New(webchat.Config{
 
 By default (when `Config.History` is nil), conversations live in browser `sessionStorage` — ephemeral, per-tab, cleared on browser close. No server-side storage, no cross-tab sync.
 
-When `Config.History` is set to a `HistoryStore` implementation, webchat mounts conversation CRUD endpoints and the browser switches to server-side mode automatically:
+When `Config.History` is set to a `HistoryStore` implementation, lmchatkit mounts conversation CRUD endpoints and the browser switches to server-side mode automatically:
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
@@ -157,7 +157,7 @@ All three share one snapshotkv database file but use distinct key prefixes, so t
 
 ### SSE event stream (cross-tab sync + push notifications)
 
-When `Config.Events` is set to an `*EventBroadcaster`, webchat mounts `GET {prefix}/api/events` — a single SSE endpoint per browser tab. The server pushes:
+When `Config.Events` is set to an `*EventBroadcaster`, lmchatkit mounts `GET {prefix}/api/events` — a single SSE endpoint per browser tab. The server pushes:
 
 | Event | When | Browser action |
 |-------|------|----------------|
@@ -207,11 +207,11 @@ The frontend reads with `fetch` + `ReadableStream` (not `EventSource` — `Event
 
 ### Tool management
 
-The server owns the tool list entirely. On each `/api/chat` request, the server calls `Host.ListTools` to get available tools, injects the virtual `webchat__get_skill` tool if skills exist, and forwards everything to the LLM. The browser never sees the tool list — it only handles the approval flow (Allow / Always Allow / Deny) when tool calls arrive as SSE events. Tool enable/disable is managed at the MCP server level (e.g. via the admin UI), not per-conversation in the browser.
+The server owns the tool list entirely. On each `/api/chat` request, the server calls `Host.ListTools` to get available tools, injects the virtual `lmchatkit__get_skill` tool if skills exist, and forwards everything to the LLM. The browser never sees the tool list — it only handles the approval flow (Allow / Always Allow / Deny) when tool calls arrive as SSE events. Tool enable/disable is managed at the MCP server level (e.g. via the admin UI), not per-conversation in the browser.
 
-This protocol is intentionally **not** OpenAI-shaped — the host's `Complete` implementation is free to call OpenAI, Anthropic, a local llama.cpp, or anything else. The reference implementation in `llmrouter` does a loopback HTTP call to its own `/v1/chat/completions` and translates OpenAI's SSE format into webchat events (including `delta.reasoning_content` / `delta.reasoning` → `EventReasoning`).
+This protocol is intentionally **not** OpenAI-shaped — the host's `Complete` implementation is free to call OpenAI, Anthropic, a local llama.cpp, or anything else. The reference implementation in `llmrouter` does a loopback HTTP call to its own `/v1/chat/completions` and translates OpenAI's SSE format into lmchatkit events (including `delta.reasoning_content` / `delta.reasoning` → `EventReasoning`).
 
-The chat request body is minimal — `{model, persona_id, messages, params}`. The server derives the system prompt from the persona (looked up by `persona_id` in the in-memory persona cache), builds the tool list from `Host.ListTools`, and injects virtual tools (`webchat__get_skill`). The browser never sends system messages or tool definitions.
+The chat request body is minimal — `{model, persona_id, messages, params}`. The server derives the system prompt from the persona (looked up by `persona_id` in the in-memory persona cache), builds the tool list from `Host.ListTools`, and injects virtual tools (`lmchatkit__get_skill`). The browser never sends system messages or tool definitions.
 
 ## Personas
 
@@ -345,18 +345,18 @@ Skills are resources with a `skill://` URI prefix that the model can retrieve on
 
 ### How it works
 
-1. On every `/api/chat` and `/api/tools` request, webchat checks the host for `skill://` resources
-2. If any exist, a virtual tool `webchat__get_skill` is appended to the tool list
+1. On every `/api/chat` and `/api/tools` request, lmchatkit checks the host for `skill://` resources
+2. If any exist, a virtual tool `lmchatkit__get_skill` is appended to the tool list
 3. The host's `SystemPromptAugmenter` (if implemented) appends skill names + descriptions to the system prompt
-4. The model calls `webchat__get_skill` with a skill URI (e.g. `skill://golang`)
-5. webchat intercepts the call and routes it to `Host.ReadResource` — never touches the MCP server
+4. The model calls `lmchatkit__get_skill` with a skill URI (e.g. `skill://golang`)
+5. lmchatkit intercepts the call and routes it to `Host.ReadResource` — never touches the MCP server
 6. The skill content is returned as a tool result; the model reads it and continues
 
 The tool is auto-approved by the browser (added to `autoAllowTools` on init) — skill loading is invisible to the user, no approval prompt.
 
-### Why `webchat__get_skill`?
+### Why `lmchatkit__get_skill`?
 
-The `webchat__` prefix prevents collisions: local scriptling tools have no prefix, remote MCP tools get their `namespace__` prefix. The tool is conditional — only appears when `skill://` resources exist.
+The `lmchatkit__` prefix prevents collisions: local scriptling tools have no prefix, remote MCP tools get their `namespace__` prefix. The tool is conditional — only appears when `skill://` resources exist.
 
 ### SystemPromptAugmenter (optional host interface)
 
@@ -373,7 +373,7 @@ type SystemPromptAugmenter interface {
 `StandardHost` also exposes the function directly:
 
 ```go
-host := &webchat.StandardHost{
+host := &lmchatkit.StandardHost{
     SystemPromptAugmenter: func(ctx context.Context, current string) string {
         return current + "\n\n" + buildSkillIndex(ctx)
     },
@@ -388,7 +388,7 @@ Skills work from any resource source because the virtual tool calls the standard
 ## Frontend
 
 The chat UI lives in [`web/`](web):
-- `web/src/chat.js` — Alpine data component (includes the markdown processor). Conversations persist to `sessionStorage`. The frontend **does not bundle its own Alpine or Tailwind** — it loads them from the host's bundled assets. This keeps webchat free of CDN dependencies and version skew.
+- `web/src/chat.js` — Alpine data component (includes the markdown processor). Conversations persist to `sessionStorage`. The frontend **does not bundle its own Alpine or Tailwind** — it loads them from the host's bundled assets. This keeps lmchatkit free of CDN dependencies and version skew.
 - `examples/chat.html` — reference template that hosts copy into their own template tree (where Tailwind can scan it during build).
 
 ### Script-order gotcha
@@ -397,9 +397,9 @@ The host's bundle calls `Alpine.start()` synchronously at the bottom. `start()` 
 
 ## Auth
 
-Auth is entirely the host's responsibility. webchat takes an `AuthMiddleware func(http.Handler) http.Handler` in `Config` and wraps every handler with it. The host decides what auth means — session cookie, bearer token, mTLS, IP allow-list, anything. nil means no auth (rare; appropriate only for fully internal hosts).
+Auth is entirely the host's responsibility. lmchatkit takes an `AuthMiddleware func(http.Handler) http.Handler` in `Config` and wraps every handler with it. The host decides what auth means — session cookie, bearer token, mTLS, IP allow-list, anything. nil means no auth (rare; appropriate only for fully internal hosts).
 
-The host's template provides whatever login/logout UI it wants — webchat's JS has no knowledge of auth endpoints.
+The host's template provides whatever login/logout UI it wants — lmchatkit's JS has no knowledge of auth endpoints.
 
 ## Testing
 
