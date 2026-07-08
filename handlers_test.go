@@ -205,6 +205,95 @@ func TestHandleChatEmitsToolCalls(t *testing.T) {
 	}
 }
 
+// TestHandleChatAlwaysInjectsSystemPrompt verifies the server always
+// prepends a system message with non-blank content: the active persona's
+// prompt when set, otherwise a sane default. A blank or whitespace-only
+// persona prompt must fall back to the default — some providers (e.g.
+// Gemma in LM Studio) reject a content-less system message.
+func TestHandleChatAlwaysInjectsSystemPrompt(t *testing.T) {
+	cases := []struct {
+		name        string
+		personaSrc  PersonaSource
+		bodyPersona string
+		wantPrompt  string
+	}{
+		{
+			name:       "no persona defaults to helpful assistant",
+			personaSrc: nil,
+			wantPrompt: "You are a helpful assistant.",
+		},
+		{
+			name: "persona prompt is used",
+			personaSrc: StaticPersonas{
+				{ID: "klingon", Name: "Klingon", SystemPrompt: "Behave like a klingon."},
+			},
+			bodyPersona: "klingon",
+			wantPrompt:  "Behave like a klingon.",
+		},
+		{
+			name: "blank persona prompt defaults",
+			personaSrc: StaticPersonas{
+				{ID: "empty", Name: "Empty", SystemPrompt: ""},
+			},
+			bodyPersona: "empty",
+			wantPrompt:  "You are a helpful assistant.",
+		},
+		{
+			name: "whitespace-only persona prompt defaults",
+			personaSrc: StaticPersonas{
+				{ID: "spaces", Name: "Spaces", SystemPrompt: "   \t\n  "},
+			},
+			bodyPersona: "spaces",
+			wantPrompt:  "You are a helpful assistant.",
+		},
+		{
+			name: "unknown persona id defaults",
+			personaSrc: StaticPersonas{
+				{ID: "klingon", Name: "Klingon", SystemPrompt: "Behave like a klingon."},
+			},
+			bodyPersona: "does-not-exist",
+			wantPrompt:  "You are a helpful assistant.",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var got CompleteRequest
+			host := &fakeHost{
+				complete: func(ctx context.Context, req CompleteRequest, events chan<- Event) error {
+					got = req
+					events <- Event{Type: EventDone, FinishReason: FinishStop}
+					return nil
+				},
+			}
+			cfg := Config{Prefix: "/chat", Host: host}
+			if c.personaSrc != nil {
+				cfg.PersonaSource = c.personaSrc
+			}
+			s, err := New(cfg)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			body := `{"model":"m","persona_id":"` + c.bodyPersona + `","messages":[{"role":"user","content":"hi"}]}`
+			req := httptest.NewRequest(http.MethodPost, "/chat/api/chat", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+			s.handleChat(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status: %d (%s)", rec.Code, rec.Body.String())
+			}
+			if len(got.Messages) == 0 || got.Messages[0].Role != RoleSystem {
+				t.Fatalf("expected leading system message, got %+v", got.Messages)
+			}
+			content, _ := got.Messages[0].Content.(string)
+			if content != c.wantPrompt {
+				t.Fatalf("system prompt: want %q got %q", c.wantPrompt, content)
+			}
+		})
+	}
+}
+
 func TestHandleChatRejectsBadRequests(t *testing.T) {
 	s := newTestServer(t, &fakeHost{})
 

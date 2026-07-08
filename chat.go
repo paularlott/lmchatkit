@@ -75,7 +75,23 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Guarantee a non-blank base prompt. A persona with an empty or
+	// whitespace-only system prompt (or no persona at all) falls back to
+	// a sane default so the prepended system message always carries
+	// content — some providers reject a content-less system message
+	// (e.g. Gemma in LM Studio) and the OpenAI spec requires content on
+	// system/user/tool roles. The default is applied before augmentation
+	// so decorations (skills, etc.) append to a real prompt rather than a
+	// leading blank line.
+	if strings.TrimSpace(systemPrompt) == "" {
+		systemPrompt = "You are a helpful assistant."
+	}
+
 	// Dynamically augment the system prompt if the host supports it.
+	// The host may append decorations (e.g. available skills). The
+	// augmented prompt is only sent to the LLM — it is never persisted
+	// or returned to the browser (system messages are stripped from the
+	// stored conversation and from any response).
 	if a, ok := s.host.(SystemPromptAugmenter); ok {
 		systemPrompt = a.AugmentSystemPrompt(r.Context(), systemPrompt)
 	}
