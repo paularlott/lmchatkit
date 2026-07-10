@@ -279,7 +279,7 @@ if (window.Alpine && typeof window.Alpine.data === "function") {
   });
 }
 
-function lmchatkit({ prefix, browserOnly = false }) {
+function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
   let _msgSeq = 0;
   return {
     prefix,
@@ -452,6 +452,8 @@ function lmchatkit({ prefix, browserOnly = false }) {
         if (this.personas.length === 1 && this.models.length === 1 && this.conversations.length === 0) {
           this.selectSetupPersona(this.personas[0]);
           this.setupModel = this.models[0].id;
+          this.startChat();
+        } else if (autoStartChat && this.currentId === null) {
           this.startChat();
         }
       }).catch((e) => console.warn("lmchatkit init failed", e));
