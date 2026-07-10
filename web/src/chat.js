@@ -35,7 +35,7 @@
 
     // Tables (multi-line, pipe-delimited, optional header separator row).
     text = text.replace(/^((?:\|.*\|(?:\s*\n|$))+)/gm, (match) => {
-      return processTable(match);
+      return processTable(match) + '\n';
     });
 
     // Now process everything else.
@@ -46,11 +46,11 @@
       .replace(/^((?:>\s*.+(?:\n|$))+)/gm, (match) => {
         const lines = match.split('\n').filter((line) => line.trim());
         const content = lines.map((line) => line.replace(/^>\s?/, '')).join('\n');
-        return `<blockquote class="md-blockquote">${processNestedMarkdown(content)}</blockquote>`;
+        return `<blockquote class="md-blockquote">${processNestedMarkdown(content)}</blockquote>\n`;
       })
       // Lists (ordered and unordered, with nesting).
       .replace(/^((?:[ \t]*(?:\d+\.|\*|\+|\-)\s+.+(?:\n|$))+)/gm, (match) => {
-        return processLists(match);
+        return processLists(match) + '\n';
       })
       // Horizontal rules.
       .replace(/^---\s*$/gm, '<hr class="md-hr">')
