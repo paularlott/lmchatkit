@@ -2000,6 +2000,10 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     async executeToolCall(call) {
       if (call.executed) return;
       call.executed = true;
+      // running drives the inline "running" animation in the template so a
+      // slow tool call is visibly in progress instead of looking dead. It
+      // stays true across both success and error paths (cleared in finally).
+      call.running = true;
       try {
         const r = await fetch(`${this.prefix}/api/tools/call`, {
           method: "POST",
@@ -2027,6 +2031,8 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
           content: "[error] " + e.message,
         });
         call.approval = "error";
+      } finally {
+        call.running = false;
       }
       this.persist();
       this.scrollToBottom();
