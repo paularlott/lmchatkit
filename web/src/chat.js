@@ -457,6 +457,11 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
           this.loadResources(),
         ]);
       }).then(() => {
+        // Apply the last-used (or Default) persona + model to the setup
+        // screen so the model field is pre-filled from the persona's
+        // default_model. Runs before the conditional branches below so
+        // every path benefits.
+        this._applyLastSetup();
         if (this.personas.length === 1 && this.models.length === 1 && this.conversations.length === 0) {
           this.selectSetupPersona(this.personas[0]);
           this.setupModel = this.models[0].id;
@@ -1237,6 +1242,30 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       sessionStorage.removeItem("lmchatkit:currentId");
       // Note: autoAllowTools is NOT reset — "Always Allow" is
       // session-global, not per-chat.
+      this._applyLastSetup();
+    },
+
+    // _applyLastSetup restores the last-used persona + model from this
+    // browser session, or falls back to Default (applying its default_model
+    // + params if the admin set them). Called from newChat() and from
+    // init()'s autoStart path so every new chat starts with sensible
+    // defaults instead of a blank model.
+    _applyLastSetup() {
+      try {
+        const saved = JSON.parse(sessionStorage.getItem("lmchatkit:lastSetup") || "null");
+        if (saved && this.personas.some((p) => p.id === saved.personaId)) {
+          this.selectSetupPersona(
+            this.personas.find((p) => p.id === saved.personaId)
+          );
+          if (saved.model && this.models.some((m) => m.id === saved.model)) {
+            this.setupModel = saved.model;
+          }
+          return;
+        }
+      } catch {}
+      // No saved setup — use Default, apply its default_model + params.
+      const dp = this.personas.find((p) => p.id === "default");
+      if (dp) this.selectSetupPersona(dp);
     },
 
     startChat() {
@@ -1255,6 +1284,11 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       // No system message — the server derives it from the persona
       // on each /api/chat request. The browser never stores or sends
       // system messages.
+      // Remember this persona + model for the next new chat in this session.
+      sessionStorage.setItem("lmchatkit:lastSetup", JSON.stringify({
+        personaId: persona.id,
+        model: this.setupModel,
+      }));
       this.conversations.unshift(conv);
       this.currentId = id;
       sessionStorage.setItem("lmchatkit:currentId", id);
