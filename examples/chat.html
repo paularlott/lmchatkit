@@ -127,7 +127,7 @@
             </div>
 
             <!-- Messages -->
-            <div x-ref="messages" @scroll="onMessagesScroll($event)"
+            <div x-ref="messages"
                  class="flex-1 overflow-y-auto space-y-4 pr-1 relative">
               <template x-for="(m, idx) in messages" :key="idx">
                 <!-- Skip tool-role messages from the main loop. Their result
@@ -271,14 +271,12 @@
                    until the first delta arrives, then carries the streaming
                    text + typing cursor. One bubble, one place to look. -->
 
-              <!-- Jump-to-bottom button: appears when the user has scrolled
-                   up while a response is streaming, so they can snap back
-                   to the latest output without having to wheel all the way
-                   down. Clicking also clears userHasScrolled so auto-scroll
-                   resumes. -->
-              <div x-show="userHasScrolled" x-transition.opacity
+              <!-- Jump-to-bottom button: appears whenever follow mode is
+                   paused (the user scrolled up to read). Clicking it re-arms
+                   follow and snaps back to the newest output. -->
+              <div x-show="!following" x-transition.opacity
                    class="sticky bottom-2 flex justify-center pointer-events-none">
-                <button @click="userHasScrolled = false; scrollToBottom()"
+                <button @click="jumpToBottom()"
                         class="pointer-events-auto px-3 py-1.5 rounded-full bg-white dark:bg-slate-800 shadow-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-700 cursor-pointer flex items-center gap-1.5">
                   <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 14l-7 7m0 0l-7-7m7 7V3" />

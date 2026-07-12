@@ -351,17 +351,16 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     historyIndex: -1,
     partialDraft: "",
 
-    // Auto-scroll: while streaming we scroll the transcript to the bottom
-    // whenever new content arrives. If the user scrolls up (mouse wheel,
-    // touch) we stop auto-scrolling so the content they're reading doesn't
-    // jump. Scrolling back to the bottom re-enables auto-scroll.
-    //
-    // We detect "user scrolled up" via wheel/touch events, NOT scroll
-    // events — scroll events fire for our own programmatic scrollTop
-    // assignments and the timing is racy (the browser fires them as async
-    // tasks, which can arrive after our _programmaticScroll flag was reset).
-    // Wheel and touchmove are 100% user-initiated — no false positives.
-    userHasScrolled: false,
+    // Auto-scroll follow. During streaming a timer (_followTimer) fires
+    // every 50ms and sets scrollTop = scrollHeight so the view tracks
+    // streaming text, thinking blocks, tool cards and markdown reflows
+    // without fighting the browser's scroll anchoring. After streaming
+    // ends the scroll listener updates `following` from isAtBottom(), so
+    // the user can scroll up to read and the "Latest" button appears.
+    // jumpToBottom() forces a scroll and re-arms follow — used by the
+    // timer, tool confirmations, conversation load, and the button.
+    following: true,
+    _followTimer: null,
 
     // Setup modal state
     setupPersonaId: "default",
@@ -437,6 +436,14 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     _resizeStart: null,
 
     init() {
+      // Store the component root element so we can find x-ref elements
+      // even when they're inside a host's nested x-data scope (Alpine
+      // registers $refs on the closest x-data component, so refs inside
+      // a host's own x-data aren't visible on this component's $refs).
+      this._rootEl = this.$el;
+      // Attach the auto-scroll observer as soon as the transcript element
+      // exists (setupAutoScroll defers via $nextTick).
+      this.setupAutoScroll();
       // Detect server-side history mode first — determines whether
       // conversations live on the server (persistent, cross-tab) or in
       // sessionStorage (ephemeral, per-tab).
@@ -807,9 +814,9 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     // viewing and replaces messages in-place. Used when another tab saves
     // the same conversation — the new content appears live. Unlike
     // loadConversation, this does NOT reset currentId, sessionStorage,
-    // or steal focus — those are already correct. It also
-    // does NOT force userHasScrolled=false, so if the user scrolled up
-    // to read, they stay where they are.
+    // or steal focus — those are already correct. It also does NOT force
+    // follow, so if the user scrolled up to read, they stay where they are
+    // (pin() is a no-op while paused).
     //
     // Race guard: if the user sends a message while the fetch is in
     // flight (changing this.messages.length), the reload is aborted so
@@ -861,7 +868,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
           }
         }
 
-        this.scrollToBottom();
+        requestAnimationFrame(() => { if (this.following) this.jumpToBottom(); });
       } catch {}
     },
 
@@ -944,6 +951,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     get currentPersonaName() {
       const c = this.current;
       if (!c) return "";
+      if (!this.personas) return "Default";
       const p = this.personas.find((x) => x.id === (c.persona_id || c.personaId));
       return p ? p.name : "Default";
     },
@@ -958,6 +966,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     // messages.length - 1) for streaming/dots so it survives proxy identity
     // quirks across rapid pushes.
     get lastAssistant() {
+      if (!this.messages || !this.messages.length) return null;
       const last = this.messages[this.messages.length - 1];
       return last && last.role === "assistant" ? last : null;
     },
@@ -985,12 +994,16 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       }));
       sessionStorage.setItem("lmchatkit:conversations", JSON.stringify(cleaned));
     },
-    get current() { return this.conversations.find((c) => c.id === this.currentId); },
+    get current() {
+      if (!this.conversations) return null;
+      return this.conversations.find((c) => c.id === this.currentId);
+    },
 
     // -- new chat setup: searchable persona + model pickers -------------
 
     get setupPersonaMatches() {
-      const s = this.setupPersonaSearch.toLowerCase().trim();
+      if (!this.personas) return [];
+      const s = (this.setupPersonaSearch || "").toLowerCase().trim();
       if (!s) return this.personas;
       return this.personas.filter((p) =>
         p.name.toLowerCase().includes(s) ||
@@ -999,7 +1012,8 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     },
 
     get setupModelMatches() {
-      const s = this.setupModelSearch.toLowerCase().trim();
+      if (!this.models) return [];
+      const s = (this.setupModelSearch || "").toLowerCase().trim();
       if (!s) return this.models;
       return this.models.filter((m) =>
         m.id.toLowerCase().includes(s) ||
@@ -1086,7 +1100,8 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     },
 
     get editPersonaMatches() {
-      const s = this.editPersonaSearch.toLowerCase().trim();
+      if (!this.personas) return [];
+      const s = (this.editPersonaSearch || "").toLowerCase().trim();
       if (!s) return this.personas;
       return this.personas.filter((p) =>
         p.name.toLowerCase().includes(s) ||
@@ -1095,7 +1110,8 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     },
 
     get editModelMatches() {
-      const s = this.editModelSearch.toLowerCase().trim();
+      if (!this.models) return [];
+      const s = (this.editModelSearch || "").toLowerCase().trim();
       if (!s) return this.models;
       return this.models.filter((m) =>
         m.id.toLowerCase().includes(s) ||
@@ -1153,6 +1169,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     // persist no-op overrides — same convention as the setup screen.
     get editEffectiveParams() {
       const out = {};
+      if (!this.editParams) return out;
       for (const [k, v] of Object.entries(this.editParams)) {
         if (v !== null && v !== "" && v !== undefined && !Number.isNaN(v)) {
           out[k] = typeof v === "string" ? parseFloat(v) : v;
@@ -1196,16 +1213,18 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     // Build the effective params map for the conversation: start with persona
     // defaults, override with user-specified values from the setup fields.
     get setupEffectiveParams() {
-      const persona = this.personas.find((p) => p.id === this.setupPersonaId);
+      const persona = this.personas ? this.personas.find((p) => p.id === this.setupPersonaId) : null;
       const params = {};
       if (persona && persona.params) {
         for (const [k, v] of Object.entries(persona.params)) {
           params[k] = v;
         }
       }
-      for (const [k, v] of Object.entries(this.setupParams)) {
-        if (v !== null && v !== "" && v !== undefined) {
-          params[k] = typeof v === "string" ? parseFloat(v) : v;
+      if (this.setupParams) {
+        for (const [k, v] of Object.entries(this.setupParams)) {
+          if (v !== null && v !== "" && v !== undefined) {
+            params[k] = typeof v === "string" ? parseFloat(v) : v;
+          }
         }
       }
       return params;
@@ -1244,7 +1263,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         // stored locally — server mode saves via persist() on first send.
         this.writeStorage();
       }
-      this.$nextTick(() => this.$refs.composer && this.$refs.composer.focus());
+      this.$nextTick(() => this._ref("composer") && this._ref("composer").focus());
     },
 
     async loadConversation(id) {
@@ -1261,8 +1280,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
           this.currentId = id;
           sessionStorage.setItem("lmchatkit:currentId", id);
           this.messages = this.normalizeMessages(data.messages);
-          this.userHasScrolled = false;
-          this.scrollToBottom();
+          this._scrollAfterLoad();
           this.focusComposer();
         } catch {}
       } else {
@@ -1271,10 +1289,23 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         this.currentId = id;
         sessionStorage.setItem("lmchatkit:currentId", id);
         this.messages = c.messages;
-        this.userHasScrolled = false;
-        this.scrollToBottom();
+        this._scrollAfterLoad();
         this.focusComposer();
       }
+    },
+
+    // _scrollAfterLoad scrolls to the bottom after loading a conversation.
+    // requestAnimationFrame runs AFTER all microtasks (Alpine's x-for and
+    // x-html effects) have flushed, so scrollHeight reflects the fully
+    // rendered messages. A second rAF catches any late layout, and a
+    // 150ms timeout catches images / code highlighting that lands later.
+    _scrollAfterLoad() {
+      this.following = true;
+      requestAnimationFrame(() => {
+        this.jumpToBottom();
+        requestAnimationFrame(() => this.jumpToBottom());
+      });
+      setTimeout(() => this.jumpToBottom(), 150);
     },
 
     deleteCurrent() {
@@ -1462,7 +1493,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       // Move caret to the end so a follow-up Up/Down continues from the
       // expected position.
       this.$nextTick(() => {
-        const el = this.$refs.composer;
+        const el = this._ref("composer");
         if (el) {
           el.selectionStart = el.selectionEnd = el.value.length;
           this.autosize();
@@ -1474,7 +1505,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       const draft = this.draft.trim();
       if (!draft || this.streaming) return;
 
-      this.userHasScrolled = false;
+      this.following = true;
       this.recordInputHistory(draft);
 
       // Built-in meta commands (don't go to the model directly)
@@ -1525,7 +1556,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       if (c && c.title === "New conversation") {
         c.title = draft.slice(0, 50);
       }
-      this.scrollToBottom();
+      this.jumpToBottom();
       this.persist();
       await this.streamTurn();
     },
@@ -1540,7 +1571,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         content: "",
         info: { kind, title, items },
       });
-      this.scrollToBottom();
+      this.jumpToBottom();
       this.persist();
     },
 
@@ -1563,6 +1594,11 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
 
     async streamTurn() {
       this.streaming = true;
+      // Start the follow timer — continuously scrolls to the bottom every
+      // 50ms so streaming text, thinking blocks and tool cards stay in
+      // view. The first scroll is immediate (the empty bubble's bouncing
+      // dots are visible right away).
+      this._startFollow();
       // Push the empty assistant bubble BEFORE issuing the fetch. Knot does
       // this and it's the difference between "model takes 10s to load in
       // LM Studio, user sees a white square with no feedback" and "user
@@ -1577,10 +1613,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         showThinking: false,
         tool_calls: [],
       });
-      // Scroll immediately so the bouncing dots (inside the empty bubble)
-      // are visible while the model loads — not just when the first delta
-      // arrives (which can take 10+ seconds on slow providers).
-      this.scrollToBottom();
+      // _startFollow already scrolled — no separate jumpToBottom needed.
       const reactiveAssistant = this.messages[this.messages.length - 1];
       // Per-turn state for <think>-tag buffering (some open-source models
       // embed reasoning inline in content rather than via reasoning_content).
@@ -1623,7 +1656,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
             // arrives so the user sees the model reason in real time. They
             // can collapse it manually after.
             reactiveAssistant.showThinking = true;
-            this.scrollToBottom();
+            this.jumpToBottom();
           } else if (ev.type === "delta") {
             // Buffer-then-route so <think> tags split across deltas still
             // parse correctly. Same algorithm as knot.
@@ -1656,7 +1689,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
                 inThinkTag = true;
               }
             }
-            this.scrollToBottom();
+            this.jumpToBottom();
           } else if (ev.type === "tool_call" && ev.tool_call) {
             // Auto-allow if the user previously chose "Always Allow" for this
             // tool in this conversation. Otherwise mark pending so the
@@ -1669,14 +1702,12 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
               approval: approved ? "approved" : "pending",
               auto: approved,
             });
-            // Force-scroll: the approval prompt (if pending) lives at the
-            // bottom of this bubble, so override userHasScrolled to make
-            // sure it's on screen. Without this an open Thinking block
-            // above can push the prompt out of view.
+            // A pending call renders an approval prompt — force it into
+            // view immediately (the follow timer may not have ticked yet).
+            // Auto-approved calls are just content; the timer handles them.
             if (!approved) {
-              this.userHasScrolled = false;
+              this.jumpToBottom();
             }
-            this.scrollToBottom();
           } else if (ev.type === "done") {
             // Tools/prompts/resources changes are pushed via SSE events
             // (subscribeToEvents). In sessionStorage mode without SSE,
@@ -1752,13 +1783,13 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         }
       } finally {
         this.streaming = false;
+        this._stopFollow();
         this.abortController = null;
         // Safety-net persist: guarantees the full conversation (including
         // the last assistant response) is saved even if earlier persist
         // calls raced with SSE-driven list refreshes.
         this.persist();
         this.focusComposer();
-        this.scrollToBottom();
       }
     },
 
@@ -1817,9 +1848,8 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       const compactingBubble = this.messages[this.messages.length - 1];
 
       this.streaming = true;
+      this._startFollow();
       this.abortController = new AbortController();
-      this.userHasScrolled = false;
-      this.scrollToBottom();
 
       try {
         const r = await fetch(`${this.prefix}/api/chat`, {
@@ -1887,6 +1917,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
           [{ name: (e && e.message) || "Unknown error", description: "" }]);
       } finally {
         this.streaming = false;
+        this._stopFollow();
         this.abortController = null;
         this.persist();
         this.focusComposer();
@@ -1956,7 +1987,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       });
       call.approval = "denied";
       this.persist();
-      this.scrollToBottom();
+      this.jumpToBottom();
       await this.maybeResumeAfterApproval();
     },
 
@@ -1984,7 +2015,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         (c) => c.approval === "pending" || c.approval === "approving" || c.approval === "denying"
       );
       if (stillPending) return;
-      this.userHasScrolled = false;
+      // streamTurn's _startFollow() will re-arm follow and scroll.
       await this.streamTurn();
     },
 
@@ -2035,7 +2066,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         call.running = false;
       }
       this.persist();
-      this.scrollToBottom();
+      this.jumpToBottom();
     },
 
     // -- slash commands ----------------------------------------------------
@@ -2043,7 +2074,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     // after the leading "/". Once a space appears (the user is typing
     // arguments), the dropdown closes.
     get slashMatches() {
-      if (!this.draft.startsWith("/")) return [];
+      if (!this.draft || !this.draft.startsWith("/")) return [];
       const name = this.draft.slice(1).split(/\s/)[0].toLowerCase();
       const builtins = [
         { id: "_compact", name: "compact", description: "Summarize conversation history to save context", _builtin: true },
@@ -2078,7 +2109,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       if (cmd._isPrompt) {
         if (cmd.argument_hint) {
           this.draft = "/" + cmd.name + " ";
-          this.$nextTick(() => this.$refs.composer && this.$refs.composer.focus());
+          this.$nextTick(() => this._ref("composer") && this._ref("composer").focus());
           return;
         }
         this.draft = "/" + cmd.name;
@@ -2093,12 +2124,12 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         return;
       }
       this.draft = "/" + cmd.name + " ";
-      this.$nextTick(() => this.$refs.composer && this.$refs.composer.focus());
+      this.$nextTick(() => this._ref("composer") && this._ref("composer").focus());
     },
 
     // -- /prompt autocomplete ---------------------------------------------
     get promptMenuMatches() {
-      if (!this.draft.startsWith("/prompt ")) return [];
+      if (!this.draft || !this.draft.startsWith("/prompt ")) return [];
       const rest = this.draft.slice(8).trim();
       if (rest.includes(" ")) return [];
       if (!rest) return (this.prompts || []).slice();
@@ -2108,11 +2139,12 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     selectPromptFromMenu(p) {
       this.draft = "/prompt " + p.name + " ";
       this.promptMenuOpen = false;
-      this.$nextTick(() => this.$refs.composer && this.$refs.composer.focus());
+      this.$nextTick(() => this._ref("composer") && this._ref("composer").focus());
     },
 
     // -- @resource autocomplete -------------------------------------------
     get resourceMenuMatches() {
+      if (!this.draft) return [];
       const m = this.draft.match(/@([\w:/.{}-]*)$/);
       if (!m) return [];
       const partial = m[1].toLowerCase();
@@ -2143,7 +2175,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         insert = r.uri;
       }
       this.draft = this.draft.replace(/@([\w:/.{}-]*)$/, "@" + insert);
-      this.$nextTick(() => this.$refs.composer && this.$refs.composer.focus());
+      this.$nextTick(() => this._ref("composer") && this._ref("composer").focus());
     },
 
     async handleSlash(input) {
@@ -2166,7 +2198,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         }
         const rendered = (cmd.body || "").replaceAll("$ARGUMENTS", args).trim();
         this.messages.push({ id: "msg-" + (++_msgSeq), role: "user", content: rendered });
-        this.scrollToBottom();
+        this.jumpToBottom();
         this.persist();
         await this.streamTurn();
         return true;
@@ -2180,6 +2212,15 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     },
 
     // -- UI helpers --------------------------------------------------------
+    // _ref finds an x-ref element, falling back to querySelector from the
+    // component root when the ref lives inside a host's nested x-data
+    // scope (Alpine's $refs only sees refs on the closest x-data component).
+    _ref(name) {
+      if (this.$refs && this.$refs[name]) return this.$refs[name];
+      if (this._rootEl) return this._rootEl.querySelector(`[x-ref="${name}"]`);
+      return null;
+    },
+
     // formatContent renders model output (markdown) to HTML. Defined here
     // rather than inline in the template so the template can call
     // m.content via formatContent(m.content) and get code blocks, tables,
@@ -2192,33 +2233,94 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       return content;
     },
 
-    // scrollToBottom pins the transcript to the latest content. No-op when
-    // the user has scrolled up to read earlier output — knot's pattern.
-    // Always called via $nextTick so the DOM has the new content first.
-    scrollToBottom() {
-      if (this.userHasScrolled) return;
+    // BOTTOM_TOLERANCE_PX is how close to the bottom counts as "at the
+    // bottom". It absorbs sub-pixel rounding and the tiny gap a pin can
+    // leave while content is still laying out, and it's the re-arm zone:
+    // scrolling to within this many px of the bottom resumes follow.
+    _bottomTolerance() { return 40; },
+
+    // isAtBottom reports whether the transcript is scrolled to (or within a
+    // few px of) the newest content.
+    isAtBottom() {
+      const el = this._ref("messages");
+      if (!el) return true;
+      return el.scrollHeight - el.scrollTop - el.clientHeight <= this._bottomTolerance();
+    },
+
+    // setupAutoScroll wires up follow mode. Three pieces, all anchored on
+    // `following`:
+    //
+    //   1. overflow-anchor:none — stops the browser adjusting scrollTop to
+    //      hold an earlier element steady when content is added, which
+    //      would both fight our scrolls and fire spurious scroll events.
+    //
+    //   2. scroll listener — updates `following = isAtBottom()` when NOT
+    //      streaming. During streaming the follow timer keeps us pinned,
+    //      so we don't touch `following` (the "Latest" button stays
+    //      hidden). After streaming, if the user scrolls up, following
+    //      flips to false and the button appears; scrolling back to the
+    //      bottom re-arms it.
+    //
+    //   3. MutationObserver + ResizeObserver — catch content changes
+    //      outside streaming (conversation reload, late layout like images
+    //      loading) and scroll only if the user hasn't scrolled away.
+    //
+    // During streaming, _startFollow() runs a 50ms interval that
+    // continuously sets scrollTop = scrollHeight. This is deliberately
+    // simple — no settle loops, no _pinning guards, no _lastScrollTop
+    // tracking. The timer IS the follow mechanism.
+    setupAutoScroll() {
       this.$nextTick(() => {
-        const el = this.$refs.messages;
-        if (el) el.scrollTop = el.scrollHeight;
+        const el = this._ref("messages");
+        if (!el) return;
+        el.style.overflowAnchor = "none";
+        el.addEventListener("scroll", () => {
+          if (this.streaming) return;
+          this.following = this.isAtBottom();
+        }, { passive: true });
+
+        new MutationObserver(() => {
+          if (this.following && !this.streaming) this.jumpToBottom();
+        }).observe(el, { childList: true, subtree: true, characterData: true });
+        if (window.ResizeObserver) {
+          new ResizeObserver(() => {
+            if (this.following && !this.streaming) this.jumpToBottom();
+          }).observe(el);
+        }
+
+        this.jumpToBottom();
       });
     },
 
-    // onWheel detects the user scrolling UP (deltaY < 0) and disables
-    // auto-scroll. Scrolling DOWN re-enables it when they reach the bottom.
-    // This replaces the old onMessagesScroll approach which was racy —
-    // scroll events from our own scrollTop assignments could arrive after
-    // the _programmaticScroll flag was reset, causing false "user scrolled
-    // up" detections that killed auto-scroll mid-stream.
-    onWheel(e) {
-      if (e.deltaY < 0) {
-        this.userHasScrolled = true;
-      } else {
-        const el = this.$refs.messages;
-        if (el) {
-          const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-          if (atBottom) this.userHasScrolled = false;
-        }
+    // jumpToBottom snaps the transcript to the newest content and re-arms
+    // follow. Called by the follow timer during streaming, on tool
+    // confirmations, on conversation load, and from the "Latest" button.
+    jumpToBottom() {
+      this.following = true;
+      const el = this._ref("messages");
+      if (el) el.scrollTop = el.scrollHeight;
+    },
+
+    // _startFollow begins a 50ms timer that continuously scrolls to the
+    // bottom while streaming. This tracks streaming text, thinking blocks,
+    // tool cards and markdown reflows (h3/ul height jumps, code blocks)
+    // without the complexity of observers and settle loops. The first
+    // scroll is immediate so the empty assistant bubble's bouncing dots
+    // are visible right away.
+    _startFollow() {
+      if (this._followTimer) return;
+      this.jumpToBottom();
+      this._followTimer = setInterval(() => this.jumpToBottom(), 50);
+    },
+
+    // _stopFollow clears the follow timer and does a final scroll to catch
+    // any content that arrived after the last tick.
+    _stopFollow() {
+      if (this._followTimer) {
+        clearInterval(this._followTimer);
+        this._followTimer = null;
       }
+      this.jumpToBottom();
     },
 
     // focusComposer puts keyboard focus back on the textarea. Called at the
@@ -2226,13 +2328,13 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     // their next message without having to click.
     focusComposer() {
       this.$nextTick(() => {
-        const el = this.$refs.composer;
+        const el = this._ref("composer");
         if (el) el.focus();
       });
     },
 
     autosize() {
-      const el = this.$refs.composer;
+      const el = this._ref("composer");
       if (!el) return;
       el.style.height = "auto";
       el.style.height = Math.min(el.scrollHeight, 160) + "px";
