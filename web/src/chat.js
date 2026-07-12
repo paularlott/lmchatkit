@@ -817,7 +817,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     // loadConversation, this does NOT reset currentId, sessionStorage,
     // or steal focus — those are already correct. It also does NOT force
     // follow, so if the user scrolled up to read, they stay where they are
-    // (pin() is a no-op while paused).
+    // (_followTick() is a no-op while following is false).
     //
     // Race guard: if the user sends a message while the fetch is in
     // flight (changing this.messages.length), the reload is aborted so
@@ -1301,7 +1301,6 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     // rendered messages. A second rAF catches any late layout, and a
     // 150ms timeout catches images / code highlighting that lands later.
     _scrollAfterLoad() {
-      this.following = true;
       requestAnimationFrame(() => {
         this.jumpToBottom();
         requestAnimationFrame(() => this.jumpToBottom());
@@ -1506,7 +1505,6 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       const draft = this.draft.trim();
       if (!draft || this.streaming) return;
 
-      this.following = true;
       this.recordInputHistory(draft);
 
       // Built-in meta commands (don't go to the model directly)
@@ -2234,9 +2232,8 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       return content;
     },
 
-    // BOTTOM_TOLERANCE_PX is how close to the bottom counts as "at the
-    // bottom". It absorbs sub-pixel rounding and the tiny gap a pin can
-    // leave while content is still laying out, and it's the re-arm zone:
+    // BOTTOM_TOLERANCE is how close to the bottom counts as "at the
+    // bottom". It absorbs sub-pixel rounding, and it's the re-arm zone:
     // scrolling to within this many px of the bottom resumes follow.
     _bottomTolerance() { return 40; },
 
@@ -2271,13 +2268,13 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         el.style.overflowAnchor = "none";
         el.addEventListener("scroll", () => {
           // Distinguish a real user scroll from our own programmatic
-          // pins. After every pin we record _lastScrollTop = the
-          // scrollTop we wrote (== max). A user scrolling UP produces a
-          // strictly smaller scrollTop AND lands away from the bottom;
-          // scrolling back to the bottom re-arms follow. Content growing
-          // below the viewport (overflow-anchor off) does NOT change
-          // scrollTop and does NOT fire a scroll event, so it can never
-          // trip the "scrolled up" test.
+          // scrolls. After every jumpToBottom/_followTick we record
+          // _lastScrollTop = the scrollTop we wrote (== max). A user
+          // scrolling UP produces a strictly smaller scrollTop AND lands
+          // away from the bottom; scrolling back to the bottom re-arms
+          // follow. Content growing below the viewport (overflow-anchor
+          // off) does NOT change scrollTop and does NOT fire a scroll
+          // event, so it can never trip the "scrolled up" test.
           if (el.scrollTop < this._lastScrollTop - 15 && !this.isAtBottom()) {
             this.following = false;
           } else if (this.isAtBottom()) {
