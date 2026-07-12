@@ -1788,7 +1788,9 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         // the last assistant response) is saved even if earlier persist
         // calls raced with SSE-driven list refreshes.
         this.persist();
-        this.focusComposer();
+        // Don't steal focus from the Allow button when there's a pending
+        // tool approval — the user needs to confirm it (Enter = Allow).
+        if (!this.hasPendingToolApprovals()) this.focusComposer();
       }
     },
 
