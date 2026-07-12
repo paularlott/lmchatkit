@@ -351,16 +351,17 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     historyIndex: -1,
     partialDraft: "",
 
-    // Auto-scroll follow. During streaming a timer (_followTimer) fires
-    // every 50ms and sets scrollTop = scrollHeight so the view tracks
-    // streaming text, thinking blocks, tool cards and markdown reflows
-    // without fighting the browser's scroll anchoring. After streaming
-    // ends the scroll listener updates `following` from isAtBottom(), so
-    // the user can scroll up to read and the "Latest" button appears.
-    // jumpToBottom() forces a scroll and re-arms follow — used by the
-    // timer, tool confirmations, conversation load, and the button.
+    // Auto-scroll follow. During streaming a 50ms timer (_followTimer)
+    // calls _followTick() which sets scrollTop = scrollHeight — but only
+    // while `following` is true. The user can scroll up to pause follow
+    // (the scroll listener detects this via _lastScrollTop comparison);
+    // the Latest button or scrolling back to the bottom resumes it.
+    // jumpToBottom() is the force-scroll variant (always scrolls, re-arms
+    // follow) — used for tool confirmations, conversation load, new
+    // messages, and the Latest button.
     following: true,
     _followTimer: null,
+    _lastScrollTop: 0,
 
     // Setup modal state
     setupPersonaId: "default",
@@ -868,7 +869,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
           }
         }
 
-        requestAnimationFrame(() => { if (this.following) this.jumpToBottom(); });
+        requestAnimationFrame(() => this._followTick());
       } catch {}
     },
 
@@ -1656,7 +1657,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
             // arrives so the user sees the model reason in real time. They
             // can collapse it manually after.
             reactiveAssistant.showThinking = true;
-            this.jumpToBottom();
+            this._followTick();
           } else if (ev.type === "delta") {
             // Buffer-then-route so <think> tags split across deltas still
             // parse correctly. Same algorithm as knot.
@@ -1689,7 +1690,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
                 inThinkTag = true;
               }
             }
-            this.jumpToBottom();
+            this._followTick();
           } else if (ev.type === "tool_call" && ev.tool_call) {
             // Auto-allow if the user previously chose "Always Allow" for this
             // tool in this conversation. Otherwise mark pending so the
@@ -2251,40 +2252,46 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     // `following`:
     //
     //   1. overflow-anchor:none — stops the browser adjusting scrollTop to
-    //      hold an earlier element steady when content is added, which
-    //      would both fight our scrolls and fire spurious scroll events.
+    //      hold an earlier element steady when content is added.
     //
-    //   2. scroll listener — updates `following = isAtBottom()` when NOT
-    //      streaming. During streaming the follow timer keeps us pinned,
-    //      so we don't touch `following` (the "Latest" button stays
-    //      hidden). After streaming, if the user scrolls up, following
-    //      flips to false and the button appears; scrolling back to the
-    //      bottom re-arms it.
+    //   2. scroll listener — the single source of truth for `following`.
+    //      Compares scrollTop against _lastScrollTop (recorded after every
+    //      programmatic scroll) to distinguish a real user scroll-up from
+    //      our own pins. Works during AND outside streaming: if the user
+    //      scrolls up, following → false (the timer stops scrolling, the
+    //      Latest button appears); scrolling back to the bottom re-arms.
     //
     //   3. MutationObserver + ResizeObserver — catch content changes
-    //      outside streaming (conversation reload, late layout like images
-    //      loading) and scroll only if the user hasn't scrolled away.
-    //
-    // During streaming, _startFollow() runs a 50ms interval that
-    // continuously sets scrollTop = scrollHeight. This is deliberately
-    // simple — no settle loops, no _pinning guards, no _lastScrollTop
-    // tracking. The timer IS the follow mechanism.
+    //      outside streaming (conversation reload, late layout) and scroll
+    //      only if the user hasn't scrolled away.
     setupAutoScroll() {
       this.$nextTick(() => {
         const el = this._ref("messages");
         if (!el) return;
         el.style.overflowAnchor = "none";
         el.addEventListener("scroll", () => {
-          if (this.streaming) return;
-          this.following = this.isAtBottom();
+          // Distinguish a real user scroll from our own programmatic
+          // pins. After every pin we record _lastScrollTop = the
+          // scrollTop we wrote (== max). A user scrolling UP produces a
+          // strictly smaller scrollTop AND lands away from the bottom;
+          // scrolling back to the bottom re-arms follow. Content growing
+          // below the viewport (overflow-anchor off) does NOT change
+          // scrollTop and does NOT fire a scroll event, so it can never
+          // trip the "scrolled up" test.
+          if (el.scrollTop < this._lastScrollTop - 15 && !this.isAtBottom()) {
+            this.following = false;
+          } else if (this.isAtBottom()) {
+            this.following = true;
+          }
+          this._lastScrollTop = el.scrollTop;
         }, { passive: true });
 
         new MutationObserver(() => {
-          if (this.following && !this.streaming) this.jumpToBottom();
+          if (!this.streaming) this._followTick();
         }).observe(el, { childList: true, subtree: true, characterData: true });
         if (window.ResizeObserver) {
           new ResizeObserver(() => {
-            if (this.following && !this.streaming) this.jumpToBottom();
+            if (!this.streaming) this._followTick();
           }).observe(el);
         }
 
@@ -2292,35 +2299,48 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       });
     },
 
-    // jumpToBottom snaps the transcript to the newest content and re-arms
-    // follow. Called by the follow timer during streaming, on tool
-    // confirmations, on conversation load, and from the "Latest" button.
+    // jumpToBottom FORCE-scrolls to the newest content and re-arms follow.
+    // Used when the user explicitly wants the bottom: tool confirmations,
+    // conversation load, new message, Latest button, streaming start.
     jumpToBottom() {
       this.following = true;
       const el = this._ref("messages");
-      if (el) el.scrollTop = el.scrollHeight;
+      if (el) {
+        el.scrollTop = el.scrollHeight;
+        this._lastScrollTop = el.scrollTop;
+      }
+    },
+
+    // _followTick scrolls to the bottom ONLY if following is true. Used by
+    // the streaming timer and observers — respects a user scroll-up.
+    _followTick() {
+      if (!this.following) return;
+      const el = this._ref("messages");
+      if (el) {
+        el.scrollTop = el.scrollHeight;
+        this._lastScrollTop = el.scrollTop;
+      }
     },
 
     // _startFollow begins a 50ms timer that continuously scrolls to the
-    // bottom while streaming. This tracks streaming text, thinking blocks,
-    // tool cards and markdown reflows (h3/ul height jumps, code blocks)
-    // without the complexity of observers and settle loops. The first
-    // scroll is immediate so the empty assistant bubble's bouncing dots
-    // are visible right away.
+    // bottom while streaming. The first scroll is forced (jumpToBottom) so
+    // the empty assistant bubble's bouncing dots are visible right away;
+    // subsequent ticks use _followTick which respects following — if the
+    // user scrolls up, the timer stops scrolling until they return.
     _startFollow() {
       if (this._followTimer) return;
       this.jumpToBottom();
-      this._followTimer = setInterval(() => this.jumpToBottom(), 50);
+      this._followTimer = setInterval(() => this._followTick(), 50);
     },
 
-    // _stopFollow clears the follow timer and does a final scroll to catch
-    // any content that arrived after the last tick.
+    // _stopFollow clears the follow timer and does a final tick (respects
+    // following — if the user scrolled up, we leave them where they are).
     _stopFollow() {
       if (this._followTimer) {
         clearInterval(this._followTimer);
         this._followTimer = null;
       }
-      this.jumpToBottom();
+      this._followTick();
     },
 
     // focusComposer puts keyboard focus back on the textarea. Called at the
