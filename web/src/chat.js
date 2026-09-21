@@ -279,6 +279,21 @@ if (window.Alpine && typeof window.Alpine.data === "function") {
   });
 }
 
+// APP_MAX_HEIGHT is the cap advertised to every mounted MCP Apps view via
+// ui/initialize's hostContext.containerDimensions.maxHeight, and the same
+// value the size-changed handler below clamps against — one constant, so
+// they can't drift apart the way a duplicated literal would (a view that
+// resizes itself past what was advertised as the ceiling would otherwise
+// silently grow taller than the chat layout was ever meant to allow).
+const APP_MAX_HEIGHT = 700;
+
+// APP_MIME_TYPE is the one content type the MCP Apps extension defines for
+// UI resources. hydrateAppResource refuses to mount anything else: the
+// spec's hosts only render app HTML, and a server that pointed
+// _meta.ui.resourceUri at an ordinary resource must surface as a load
+// failure, not execute whatever that resource contains.
+const APP_MIME_TYPE = "text/html;profile=mcp-app";
+
 function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
   let _msgSeq = 0;
   return {
@@ -290,6 +305,18 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     conversations: [],
     currentId: null,
     messages: [],
+    // Currently-mounted MCP Apps views (see mountAppView), keyed by the
+    // container element they were mounted into. Used by
+    // teardownMountedAppViews to notify a view (ui/resource-teardown, a
+    // MUST per the extension spec) before this.messages is replaced out
+    // from under it and its iframe is torn down by Alpine's x-for.
+    _mountedAppViews: new Map(),
+    // Latest ui/update-model-context payload per mounted view (keyed by the
+    // mounting tool call's id). Per the extension spec each request
+    // overwrites the previous one from that view, and the host SHOULD hand
+    // only the latest update per view to the model — which _withAppModelContext
+    // does, once, on the next outgoing turn (then clears the lot).
+    _appModelContext: {},
     streaming: false,
     draft: "",
 
@@ -527,6 +554,16 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         this.winSize = { w: null, h: null };
         this.winMaximized = false;
         try { localStorage.removeItem("lmchatkit:winGeo"); } catch {}
+      });
+
+      // Notify any mounted MCP Apps views before the page itself goes away
+      // (tab close, navigation, refresh) — pagehide fires reliably in these
+      // cases (unlike beforeunload, which bfcache-eligible navigations can
+      // skip) and still runs early enough for a fire-and-forget postMessage
+      // to go out. See teardownMountedAppViewsSync for why this can't await
+      // a reply the way every other teardown call site does.
+      window.addEventListener("pagehide", () => {
+        this.teardownMountedAppViewsSync("page_closed");
       });
     },
 
@@ -822,7 +859,69 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         }
         seen.add(m.id);
       }
+
+      // Rehydrate each tool call's result/approval/MCP-Apps state from its
+      // own persisted "tool" role message. call.result etc. only ever exist
+      // as in-memory state set by executeToolCall — a fresh conversation
+      // fetch (e.g. navigating away from chat and back) doesn't carry them
+      // on the tool_calls array itself, only on this separate message. This
+      // only fills in calls that don't already have a result (skips ones a
+      // live tab already populated), and never re-invokes the tool — the
+      // linked ui:// resource, if any, is fetched afterward by the caller
+      // (see loadConversation/reloadCurrentConversation), since that's an
+      // async step this synchronous pass can't do.
+      //
+      // Matching is by POSITION within each tool_call_id, not a plain
+      // id -> message map: some providers (observed with a local
+      // Ollama-backed model) reuse the SAME call id for every invocation of
+      // a given tool, rather than a fresh UUID per call — id equal to the
+      // tool name itself, e.g. "spin_wheel" every single time. A last-write
+      // -wins map would then pair every one of that tool's calls with
+      // whichever result happened to be persisted last, silently showing
+      // identical (and often stale) state on every card. Since a tool
+      // message always immediately follows the assistant call that
+      // produced it, per-id FIFO queues correctly pair the Nth call with
+      // the Nth result even when their ids collide.
+      const toolMsgQueues = new Map();
+      for (const m of out) {
+        if (m.role === "tool" && m.tool_call_id) {
+          if (!toolMsgQueues.has(m.tool_call_id)) toolMsgQueues.set(m.tool_call_id, []);
+          toolMsgQueues.get(m.tool_call_id).push(m);
+        }
+      }
+      for (const m of out) {
+        if (m.role !== "assistant") continue;
+        for (const call of m.tool_calls) {
+          if (call.result != null) continue;
+          const queue = toolMsgQueues.get(call.id);
+          const toolMsg = queue && queue.shift();
+          if (!toolMsg) continue;
+          call.result = toolMsg.content;
+          call.isError = !!toolMsg.is_error;
+          call.structuredContent = toolMsg.structured_content;
+          call.approval = toolMsg.is_error ? "error" : "approved";
+          call.executed = true;
+          if (!toolMsg.is_error && toolMsg.ui && toolMsg.ui.resourceUri) call.ui = toolMsg.ui;
+        }
+      }
+
       return out;
+    },
+
+    // hydrateAppViews walks the current messages for tool calls that were
+    // just rehydrated with a call.ui but no call.appResource yet (see
+    // normalizeMessages) and fetches each one's resource. Called after
+    // loading/reloading a conversation — fire-and-forget per call, so a
+    // slow or offline resource fetch doesn't hold up the rest of the page.
+    hydrateAppViews() {
+      for (const m of this.messages) {
+        if (m.role !== "assistant") continue;
+        for (const call of m.tool_calls) {
+          if (call.ui && call.ui.resourceUri && !call.appResource && !call.isError) {
+            this.hydrateAppResource(call);
+          }
+        }
+      }
     },
 
     // reloadCurrentConversation fetches the conversation we're currently
@@ -847,41 +946,76 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         if (this.messages.length !== prevLen) return;
 
         // Preserve browser-only tool call state (result, approval,
-        // executed, isError, auto) that the server doesn't persist.
-        // Without this, an SSE-triggered reload after a deny/execute
-        // would wipe the result from the UI.
-        const prevTCState = new Map();
+        // executed, isError, auto, and the MCP Apps ui/appResource/
+        // structuredContent set by executeToolCall) that the server doesn't
+        // persist as such — it's just JSON on the stored message, so this
+        // guards a race where another tab's SSE-triggered reload arrives
+        // with a stale snapshot taken before this tab finished executing
+        // and persisting the call. Without this, that race would wipe the
+        // result (or unmount an already-rendered app) from the UI.
+        //
+        // Queued (FIFO) per id, not a plain map, for the same reason as
+        // normalizeMessages' rehydration: some providers reuse one call id
+        // for every invocation of a given tool, so a last-write-wins map
+        // would merge the SAME previous state onto every one of that
+        // tool's calls instead of each call's own.
+        const prevTCQueues = new Map();
         for (const m of this.messages) {
           if (m.role === "assistant" && m.tool_calls) {
             for (const tc of m.tool_calls) {
-              prevTCState.set(tc.id, {
+              if (!prevTCQueues.has(tc.id)) prevTCQueues.set(tc.id, []);
+              prevTCQueues.get(tc.id).push({
                 result: tc.result,
                 approval: tc.approval,
                 executed: tc.executed,
                 isError: tc.isError,
                 auto: tc.auto,
+                ui: tc.ui,
+                appResource: tc.appResource,
+                structuredContent: tc.structuredContent,
               });
             }
           }
         }
 
-        this.messages = this.normalizeMessages(data.messages);
+        const normalized = this.normalizeMessages(data.messages);
 
         // Merge back browser-only state onto the reloaded tool calls.
-        for (const m of this.messages) {
+        for (const m of normalized) {
           if (m.role === "assistant" && m.tool_calls) {
             for (const tc of m.tool_calls) {
-              const prev = prevTCState.get(tc.id);
+              const queue = prevTCQueues.get(tc.id);
+              const prev = queue && queue.shift();
               if (prev) {
                 tc.result = prev.result;
                 tc.approval = prev.approval;
                 tc.executed = prev.executed;
                 tc.isError = prev.isError;
                 tc.auto = prev.auto;
+                tc.ui = prev.ui;
+                tc.appResource = prev.appResource;
+                tc.structuredContent = prev.structuredContent;
               }
             }
           }
         }
+
+        // Tear down (with notice) any mounted view whose call didn't
+        // survive into the merged, final state — before swapping messages
+        // in triggers Alpine to actually remove its DOM node. See
+        // teardownOrphanedAppViews for why this doesn't just tear down
+        // everything.
+        const survivingCallIds = new Set();
+        for (const m of normalized) {
+          if (m.role !== "assistant") continue;
+          for (const call of m.tool_calls) {
+            if (call.ui && call.ui.resourceUri && !call.isError) survivingCallIds.add(call.id);
+          }
+        }
+        await this.teardownOrphanedAppViews(survivingCallIds, "conversation_reloaded");
+
+        this.messages = normalized;
+        this.hydrateAppViews();
 
         requestAnimationFrame(() => this._followTick());
       } catch {}
@@ -1255,6 +1389,11 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     },
 
     newChat() {
+      // Fire-and-forget: newChat is synchronous (many call sites, some of
+      // them not worth making async just for this), and the notification
+      // still gets its head start over Alpine's own reactive DOM removal
+      // either way — see teardownMountedAppViews.
+      this.teardownMountedAppViews("conversation_closed");
       this.currentId = null;
       this.messages = [];
       sessionStorage.removeItem("lmchatkit:currentId");
@@ -1287,6 +1426,8 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     },
 
     startChat() {
+      // Fire-and-forget — see newChat's identical comment.
+      this.teardownMountedAppViews("conversation_closed");
       const id = "c-" + Math.random().toString(36).slice(2, 10);
       const persona = this.personas.find((p) => p.id === this.setupPersonaId) || { id: "default" };
       const conv = {
@@ -1325,6 +1466,13 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       const observed = this.conversations.find((c) => c.id === id);
       if (observed) observed.unread = false;
 
+      // Only an actual switch away from the current conversation destroys
+      // its mounted views (id === this.currentId, or currentId unset on
+      // first load, means nothing needs tearing down). Awaited — this
+      // function is already async, so honoring the spec's "SHOULD wait for
+      // a response before tearing down" costs nothing extra here.
+      if (id !== this.currentId) await this.teardownMountedAppViews("conversation_switched");
+
       if (this._serverMode) {
         try {
           const r = await fetch(`${this.prefix}/api/conversations/${id}`);
@@ -1333,6 +1481,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
           this.currentId = id;
           sessionStorage.setItem("lmchatkit:currentId", id);
           this.messages = this.normalizeMessages(data.messages);
+          this.hydrateAppViews();
           this._scrollAfterLoad();
           this.focusComposer();
         } catch {}
@@ -1342,6 +1491,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         this.currentId = id;
         sessionStorage.setItem("lmchatkit:currentId", id);
         this.messages = c.messages;
+        this.hydrateAppViews();
         this._scrollAfterLoad();
         this.focusComposer();
       }
@@ -1386,6 +1536,8 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         this.writeStorage();
       }
       if (id === this.currentId) {
+        // Fire-and-forget — see newChat's identical comment.
+        this.teardownMountedAppViews("conversation_deleted");
         this.currentId = null;
         sessionStorage.removeItem("lmchatkit:currentId");
         this.messages = [];
@@ -1749,6 +1901,45 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       this.attachments.splice(idx, 1);
     },
 
+    // _withAppModelContext appends the pending ui/update-model-context
+    // payloads (stored by the view bridge, latest-per-view) to the outgoing
+    // turn as one synthetic user message, then clears them — per the
+    // extension spec the host SHOULD hand the context to the model in future
+    // turns, MAY defer until the next user message, and SHOULD send only the
+    // latest update per view when several arrive in between. The message is
+    // deliberately NOT pushed onto this.messages: it's model context, not
+    // conversation history — it isn't rendered and isn't persisted, and it's
+    // sent exactly once.
+    _withAppModelContext(outgoing) {
+      const updates = this._appModelContext || {};
+      this._appModelContext = {};
+      const texts = [];
+      for (const callId of Object.keys(updates)) {
+        const p = updates[callId] || {};
+        const blocks = [];
+        if (Array.isArray(p.content)) {
+          for (const b of p.content) {
+            if (b && b.type === "text" && typeof b.text === "string") {
+              blocks.push(b.text);
+            } else if (b) {
+              blocks.push(JSON.stringify(b));
+            }
+          }
+        }
+        if (p.structuredContent !== undefined && p.structuredContent !== null) {
+          blocks.push(JSON.stringify(p.structuredContent));
+        }
+        const text = blocks.join("\n").trim();
+        if (text) texts.push(text);
+      }
+      if (!texts.length) return outgoing;
+      return outgoing.concat([{
+        id: "msg-appctx-" + (++_msgSeq),
+        role: "user",
+        content: "[context updated by an app view]\n" + texts.join("\n\n"),
+      }]);
+    },
+
     async streamTurn() {
       this.streaming = true;
       // Start the follow timer — continuously scrolls to the bottom every
@@ -1792,7 +1983,9 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
           body: JSON.stringify({
             model: this.currentModel,
             persona_id: this.current?.persona_id || "",
-            messages: this.messages.slice(0, -1),
+            // _withAppModelContext defers any pending ui/update-model-context
+            // payloads into exactly this turn (see its comment).
+            messages: this._withAppModelContext(this.messages.slice(0, -1)),
             params,
           }),
           signal: this.abortController.signal,
@@ -2063,7 +2256,10 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
 
         // Replace messages with just the summary. The system prompt is
         // not stored — the server derives it from the persona on each
-        // request, so compaction doesn't need to touch it.
+        // request, so compaction doesn't need to touch it. Already async
+        // (this whole function just waited on the summarization request),
+        // so awaiting here costs nothing extra.
+        await this.teardownMountedAppViews("conversation_compacted");
         this.messages = [{
           id: "msg-" + (++_msgSeq),
           role: "assistant",
@@ -2210,16 +2406,34 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
           body: JSON.stringify({ name: call.name, arguments: call.arguments }),
         });
         const data = await r.json();
-        const content = data.content != null ? data.content : JSON.stringify(data);
+        const content = !r.ok ? (data.error || `Request failed (${r.status})`) : data.content != null ? data.content : JSON.stringify(data);
         call.result = content;
-        call.isError = !!data.is_error;
+        call.isError = !r.ok || !!data.is_error;
+        call.structuredContent = data.structured_content;
+        // Persisted alongside the plain text result so a later page reload
+        // can rebuild call.result/isError/structuredContent/ui without
+        // re-invoking the tool (see normalizeMessages' rehydration pass —
+        // tool calls aren't guaranteed idempotent, so re-running one on
+        // reload could show a different result than what actually happened).
         this.messages.push({
           id: "msg-" + (++_msgSeq), role: "tool",
           tool_call_id: call.id,
           tool_name: call.name,
           content,
+          is_error: call.isError,
+          structured_content: call.structuredContent,
+          ui: !call.isError && data.ui && data.ui.resourceUri ? data.ui : undefined,
         });
         call.approval = call.isError ? "error" : "approved";
+
+        // MCP Apps: if the tool declares a linked ui:// view, fetch it now
+        // so the template can mount it (see mountAppView). A fetch failure
+        // here just means no app renders — the plain text result above still
+        // stands, so it's swallowed rather than surfaced as a tool error.
+        if (!call.isError && data.ui && data.ui.resourceUri) {
+          call.ui = data.ui;
+          await this.hydrateAppResource(call);
+        }
       } catch (e) {
         call.result = "[error] " + e.message;
         call.isError = true;
@@ -2228,6 +2442,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
           tool_call_id: call.id,
           tool_name: call.name,
           content: "[error] " + e.message,
+          is_error: true,
         });
         call.approval = "error";
       } finally {
@@ -2235,6 +2450,433 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       }
       this.persist();
       this.jumpToBottom();
+    },
+
+    // hydrateAppResource fetches a tool call's linked ui:// resource into
+    // call.appResource, which the template's mountAppView block watches for.
+    // Called right after execution (executeToolCall) and, on reload, from
+    // the rehydration pass in loadConversation/reloadCurrentConversation —
+    // both cases just need the (idempotent) resource HTML re-fetched, never
+    // the tool re-invoked, to re-render the same already-known result.
+    // A fetch failure leaves call.appResource null, which the template's
+    // x-show="call.appResource === null" block renders as a visible error
+    // card — not surfaced as a tool error, since the plain text result
+    // still stands, but not silently blank either.
+    async hydrateAppResource(call) {
+      if (!call.ui || !call.ui.resourceUri || call.appResource) return;
+      try {
+        const resourceResp = await fetch(`${this.prefix}/api/resources/read`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ uri: call.ui.resourceUri, via: call.name }),
+        });
+        // A non-OK response (e.g. a 500 from a server error, or a 403 from
+        // toolSourceAllows) still has a valid JSON body — {"error": "..."}
+        // — so without this check it parsed as if it were a real
+        // ResourceResult. call.appResource ended up a truthy object with
+        // no .text/.blob, mountAppView built an empty-string srcdoc from
+        // it, and the user saw a blank iframe instead of the error card.
+        if (!resourceResp.ok) {
+          call.appResource = null;
+          return;
+        }
+        call.appResource = await resourceResp.json();
+        // Spec: a UI resource's mimeType MUST be text/html;profile=mcp-app.
+        // A server pointing resourceUri at an ordinary resource surfaces as
+        // the load-failure card, not as whatever that resource contains
+        // executing in the sandbox. (Absence still mounts: the read response
+        // shape predates strict hosts, and the mountAppView guard below
+        // double-checks.)
+        if (call.appResource && call.appResource.mime_type && call.appResource.mime_type !== APP_MIME_TYPE) {
+          call.appResource = null;
+        }
+      } catch (e) {
+        call.appResource = null;
+      }
+    },
+
+    // -- MCP Apps rendering -------------------------------------------------
+
+    // teardownMountedAppViews sends ui/resource-teardown (a MUST per the MCP
+    // Apps extension: "Host MUST send this notification before tearing down
+    // the UI resource, for any reason") to every currently-mounted view,
+    // then clears the tracking map. Call this — and await it — immediately
+    // before any of the several places this.messages gets replaced wholesale
+    // (switching conversations, starting a new one, deleting one, reloading,
+    // compacting), since that's what actually destroys a mounted view's
+    // iframe (Alpine's x-for removes it once call.appResource is no longer
+    // reachable) with no notice of its own. Best-effort: a torn-down view
+    // that never responds (or a page reload, where nothing can be awaited at
+    // all) still gets the destructive action to proceed rather than hang —
+    // see _sendResourceTeardown's timeout.
+    async teardownMountedAppViews(reason) {
+      const views = Array.from(this._mountedAppViews.values());
+      this._mountedAppViews = new Map();
+      await Promise.all(views.map((iframe) => this._sendResourceTeardown(iframe, reason)));
+    },
+
+    // teardownOrphanedAppViews is the surgical counterpart to
+    // teardownMountedAppViews, for reloadCurrentConversation: unlike the
+    // other call sites (switching/deleting/compacting a conversation),
+    // reloading usually leaves most mounted views' underlying tool call
+    // untouched — same call.id, same DOM node (Alpine's keyed x-for reuses
+    // it), nothing was actually destroyed. Blanket-tearing-down every view
+    // on every reload would be both wrong (telling a still-alive view it's
+    // being shut down) and disruptive (forcing an unnecessary remount, and
+    // losing any in-progress state inside the iframe, on every unrelated
+    // cross-tab update).
+    //
+    // survivingCallIds is the set of tool_call ids that still resolve to a
+    // live, non-error ui:// resource in the freshly-fetched data. A
+    // mounted view whose container's call id isn't in that set is about to
+    // be removed from the DOM by the upcoming re-render (its call was
+    // deleted, edited into an error, or shifted away by another tab's
+    // concurrent edit) with no notice of its own — those, and only those,
+    // get the teardown notification here, before the swap.
+    async teardownOrphanedAppViews(survivingCallIds, reason) {
+      const orphaned = [];
+      for (const [container, iframe] of this._mountedAppViews) {
+        if (!survivingCallIds.has(container.dataset.mcpAppCallId)) orphaned.push([container, iframe]);
+      }
+      if (!orphaned.length) return;
+      for (const [container] of orphaned) this._mountedAppViews.delete(container);
+      await Promise.all(orphaned.map(([, iframe]) => this._sendResourceTeardown(iframe, reason)));
+    },
+
+    // teardownMountedAppViewsSync fires ui/resource-teardown at every
+    // mounted view without awaiting a reply — used from the pagehide
+    // handler (see init()), where the page may be gone before any promise
+    // resolves, so there's nothing to usefully await. postMessage's send
+    // is synchronous even though delivery/handling in the iframe isn't
+    // guaranteed to complete before unload; this is the best a host can
+    // do to satisfy the spec's "MUST send this notification before tearing
+    // down" on page close.
+    teardownMountedAppViewsSync(reason) {
+      for (const iframe of this._mountedAppViews.values()) {
+        if (!iframe.isConnected || !iframe.contentWindow) continue;
+        try {
+          iframe.contentWindow.postMessage({ jsonrpc: "2.0", id: "teardown-" + Math.random().toString(36).slice(2), method: "ui/resource-teardown", params: { reason } }, "*");
+        } catch {}
+      }
+    },
+
+    // _sendResourceTeardown sends one view its ui/resource-teardown request
+    // and resolves once it replies (success or error result — either way the
+    // view had its chance to react) or after a short timeout, whichever
+    // comes first. The spec's "Host SHOULD wait for a response before
+    // tearing down" only makes sense with a bound: an unresponsive or
+    // already-gone view must not block the user's next action indefinitely.
+    _sendResourceTeardown(iframe, reason) {
+      if (!iframe.isConnected || !iframe.contentWindow) return Promise.resolve();
+      return new Promise((resolve) => {
+        const id = "teardown-" + Math.random().toString(36).slice(2);
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          window.removeEventListener("message", onMessage);
+          resolve();
+        };
+        const onMessage = (event) => {
+          if (event.source !== iframe.contentWindow) return;
+          const msg = event.data;
+          if (msg && msg.jsonrpc === "2.0" && msg.id === id) finish();
+        };
+        window.addEventListener("message", onMessage);
+        try {
+          iframe.contentWindow.postMessage({ jsonrpc: "2.0", id, method: "ui/resource-teardown", params: { reason } }, "*");
+        } catch {
+          finish();
+          return;
+        }
+        setTimeout(finish, 300);
+      });
+    },
+
+    // mountAppView renders a tool call's linked ui:// resource (set on
+    // call.ui/call.appResource by executeToolCall or the reload rehydration
+    // pass) into a sandboxed iframe and bridges the MCP Apps postMessage
+    // protocol (https://github.com/modelcontextprotocol/ext-apps) between
+    // the view and this server's own /api/tools/call and /api/resources/read
+    // routes.
+    //
+    // Called via the template's x-effect on the container element — the
+    // element only exists once call.appResource resolves (the template's
+    // x-for filters on it), so this always runs with real data on its first
+    // (and, thanks to the dataset guard below, only meaningful) invocation.
+    mountAppView(call, container) {
+      const content = call.appResource;
+      if (!content || container.dataset.mcpAppMounted) return;
+      // Defense in depth behind hydrateAppResource's check: only app HTML is
+      // ever rendered, whatever shape appResource arrived in.
+      if (content.mime_type && content.mime_type !== APP_MIME_TYPE) {
+        console.warn("lmchatkit: refusing to mount non-app resource", content.mime_type);
+        return;
+      }
+      container.dataset.mcpAppMounted = "1";
+      // Recorded so a reload can tell, per mounted container, whether the
+      // SAME tool call still owns it afterward (see
+      // teardownOrphanedAppViews) — Alpine's :key="'app-' + call.id" keeps
+      // this exact container/iframe alive across a reload as long as the
+      // key doesn't change, so only a container whose call actually
+      // disappears needs a teardown notice.
+      container.dataset.mcpAppCallId = call.id;
+
+      let html = content.text || (content.blob ? atob(content.blob) : "");
+      const metaTag = this._buildAppCSPMeta((content.ui && content.ui.csp) || {});
+      html = /<head[^>]*>/i.test(html)
+        ? html.replace(/<head[^>]*>/i, (m) => m + metaTag)
+        : metaTag + html;
+
+      const iframe = document.createElement("iframe");
+      iframe.setAttribute("sandbox", "allow-scripts allow-forms");
+      iframe.className = "w-full border-0 bg-white";
+      // Placeholder until the view reports its real size via
+      // ui/notifications/size-changed below — most views report within a
+      // frame or two of mounting, so this is only visible very briefly.
+      iframe.style.height = "160px";
+      iframe.srcdoc = html;
+      container.appendChild(iframe);
+      this._mountedAppViews.set(container, iframe);
+
+      let initialized = false;
+      const listener = async (event) => {
+        if (!iframe.isConnected) {
+          window.removeEventListener("message", listener);
+          return;
+        }
+        if (event.source !== iframe.contentWindow) return;
+        const msg = event.data;
+        if (!msg || msg.jsonrpc !== "2.0") return;
+
+        // JSON round-trip before postMessage: fields like call.arguments and
+        // call.structuredContent are read off Alpine's reactive `call`
+        // object, which wraps nested values in Proxies. The structured
+        // clone algorithm postMessage uses can't clone those Proxies
+        // (DataCloneError), so strip the reactivity by serializing to a
+        // plain value first — safe here since every payload is JSON-shaped
+        // MCP protocol data anyway.
+        const reply = (payload) => iframe.contentWindow.postMessage(JSON.parse(JSON.stringify(payload)), "*");
+
+        if (msg.method === "ui/initialize") {
+          reply({
+            jsonrpc: "2.0",
+            id: msg.id,
+            result: {
+              protocolVersion: "2026-01-26",
+              hostCapabilities: { serverTools: {}, serverResources: {}, logging: {} },
+              hostInfo: { name: "lmchatkit", version: "1.0.0" },
+              hostContext: {
+                // id is the JSON-RPC id of the tools/call that instantiated
+                // this view (spec: toolInfo SHOULD carry it alongside the
+                // tool); call.id is that call's identifier in this chat.
+                toolInfo: { id: call.id, tool: { name: call.name } },
+                // Match the host page's color scheme so views can theme
+                // themselves; fixed "light" would lie in a dark-mode host.
+                theme: (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light",
+                displayMode: "inline",
+                availableDisplayModes: ["inline"],
+                // Flexible height (the view sizes itself, up to this cap —
+                // see the "Container Dimensions" section of the MCP Apps
+                // spec) so a small app doesn't get stuck with wasted
+                // whitespace and a large one doesn't take over the whole
+                // chat. Width is intentionally left both unset here and
+                // unhandled in ui/notifications/size-changed below — the
+                // iframe's own w-full CSS class already fills the
+                // available chat width, and feeding a reported width back
+                // in risks a resize feedback loop with content (e.g.
+                // Chart.js) that itself reacts to container width.
+                containerDimensions: { maxHeight: APP_MAX_HEIGHT },
+              },
+            },
+          });
+          return;
+        }
+
+        if (msg.method === "ui/notifications/initialized") {
+          if (initialized) return;
+          initialized = true;
+          reply({ jsonrpc: "2.0", method: "ui/notifications/tool-input", params: { arguments: call.arguments || {} } });
+          reply({
+            jsonrpc: "2.0",
+            method: "ui/notifications/tool-result",
+            params: {
+              content: [{ type: "text", text: call.result }],
+              structuredContent: call.structuredContent,
+              isError: !!call.isError,
+            },
+          });
+          return;
+        }
+
+        if (msg.method === "notifications/message") return;
+
+        if (msg.method === "ui/notifications/size-changed") {
+          const height = msg.params && msg.params.height;
+          if (typeof height === "number" && height > 0) {
+            // Clamp to what was actually advertised in ui/initialize —
+            // nothing stops a view from reporting a height past the
+            // maxHeight it was told about, and without this an iframe
+            // could grow taller than the chat layout was ever meant to
+            // allow (own scrollbar inside the clamped box after this,
+            // same as any other overflowing content).
+            iframe.style.height = Math.ceil(Math.min(height, APP_MAX_HEIGHT)) + "px";
+          }
+          return;
+        }
+
+        if (msg.method === "ping") {
+          reply({ jsonrpc: "2.0", id: msg.id, result: {} });
+          return;
+        }
+
+        // A plain response (has an id, no method) isn't a request this
+        // listener should handle — e.g. the view's reply to a
+        // ui/resource-teardown request the host sent it (see
+        // _sendResourceTeardown, which listens for it itself). Without this
+        // check it falls through to "unsupported method: undefined" below
+        // and sends the view a bogus error reply to its own reply.
+        if (msg.id !== undefined && msg.method === undefined) return;
+
+        // Everything else (tools/call, resources/read, ...) is proxied to
+        // this server's own MCP-backed routes per the extension's "Sandbox
+        // proxy" behavior.
+        if (msg.id === undefined) return;
+        try {
+          let result;
+          if (msg.method === "tools/call") {
+            const resp = await fetch(`${this.prefix}/api/tools/call`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                name: resolveAppToolName(call.name, msg.params.name),
+                arguments: msg.params.arguments || {},
+                // Marks this as a call the view made of itself, not a
+                // model-approved one — the server enforces MCP Apps
+                // visibility (_meta.ui.visibility) based on this: a view may
+                // only reach a tool whose visibility includes "app".
+                source: "app",
+                // Names the tool that mounted this view, so the server can
+                // also enforce the requested tool belongs to the same MCP
+                // server (see toolSourceAllows in lmchatkit) — visibility
+                // alone can't stop a view from reaching a same-named tool
+                // on a completely different, unnamespaced federated server.
+                via: call.name,
+              }),
+            });
+            const toolData = await resp.json();
+            if (!resp.ok) throw new Error(toolData.error || `tools/call failed (${resp.status})`);
+            result = {
+              content: [{ type: "text", text: toolData.content }],
+              structuredContent: toolData.structured_content,
+              isError: !!toolData.is_error,
+            };
+          } else if (msg.method === "resources/read") {
+            const resp = await fetch(`${this.prefix}/api/resources/read`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              // via scopes the read to the mounting tool's own MCP server
+              // (see toolSourceAllows/handleReadResource in lmchatkit) —
+              // otherwise the view could read any resource from any
+              // connected server just by knowing its URI.
+              body: JSON.stringify({ uri: msg.params.uri, via: call.name }),
+            });
+            const resData = await resp.json();
+            if (!resp.ok) throw new Error(resData.error || `resources/read failed (${resp.status})`);
+            result = { contents: [{ uri: resData.uri, text: resData.text, blob: resData.blob, mimeType: resData.mime_type }] };
+          } else if (msg.method === "ui/open-link") {
+            // Spec: host SHOULD open the URL in the user's browser. Scheme is
+            // restricted to http(s) — javascript:, data: etc. would hand the
+            // view code an execution context outside its sandbox.
+            let url;
+            try {
+              url = new URL(String((msg.params || {}).url || ""));
+            } catch {
+              url = null;
+            }
+            if (!url || (url.protocol !== "http:" && url.protocol !== "https:")) {
+              throw new Error("Invalid URL");
+            }
+            // noopener/noreferrer: the opened page must not get a window
+            // reference back into the host page.
+            if (!window.open(url.href, "_blank", "noopener,noreferrer")) {
+              throw new Error("Link opening failed"); // popup blocked
+            }
+            result = {};
+          } else if (msg.method === "ui/message") {
+            // Spec: host SHOULD add the message to the conversation context.
+            // Rendering it as an ordinary chat message does exactly that —
+            // the next model turn sends the full history — and keeps the
+            // user in the loop on what the view said.
+            const p = msg.params || {};
+            const text = p.content && typeof p.content.text === "string" ? p.content.text : "";
+            if (!text.trim()) throw new Error("Invalid message format");
+            this.messages.push({
+              id: "msg-" + (++_msgSeq),
+              role: p.role === "assistant" ? "assistant" : "user",
+              content: text,
+            });
+            this.jumpToBottom();
+            this.persist();
+            result = {};
+          } else if (msg.method === "ui/request-display-mode") {
+            // Only "inline" is supported — advertised as such in
+            // hostContext.availableDisplayModes — and the spec requires the
+            // response to carry the resulting mode either way.
+            result = { mode: "inline" };
+          } else if (msg.method === "ui/update-model-context") {
+            // Store, don't send: per spec the host MAY defer the context to
+            // the next user message, and _withAppModelContext splices it
+            // into exactly that outgoing turn (latest-per-view, sent once).
+            this._appModelContext[call.id] = msg.params || {};
+            result = {};
+          } else {
+            throw new Error("unsupported method: " + msg.method);
+          }
+          reply({ jsonrpc: "2.0", id: msg.id, result });
+        } catch (err) {
+          reply({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: err.message } });
+        }
+      };
+      window.addEventListener("message", listener);
+    },
+
+    // _buildAppCSPMeta builds the <meta http-equiv="Content-Security-Policy">
+    // tag injected into a UI resource's HTML from its _meta.ui.csp hints,
+    // approximating what a real host would send as a response header on the
+    // resource it serves the iframe from.
+    _buildAppCSPMeta(csp) {
+      // 'self' here would resolve against the srcdoc iframe's own opaque
+      // origin (no allow-same-origin), which no real request can ever
+      // match — so as a default it's inert today, but a silent landmine if
+      // allow-same-origin is ever added to the sandbox attribute (it would
+      // then quietly mean "back to the host page's own origin"). 'none'
+      // says what's actually intended: no undeclared network access.
+      const connect = (csp.connectDomains && csp.connectDomains.length) ? ["'self'"].concat(csp.connectDomains) : ["'none'"];
+      const resource = ["'self'", "'unsafe-inline'", "data:"].concat(csp.resourceDomains || []);
+      const frame = (csp.frameDomains && csp.frameDomains.length) ? csp.frameDomains : ["'none'"];
+      const base = (csp.baseUriDomains && csp.baseUriDomains.length) ? ["'self'"].concat(csp.baseUriDomains) : ["'self'"];
+      const policy = [
+        "default-src 'none'",
+        `script-src ${resource.join(" ")}`,
+        `style-src ${resource.join(" ")}`,
+        `img-src ${resource.join(" ")}`,
+        `font-src ${resource.join(" ")}`,
+        `media-src ${resource.join(" ")}`,
+        `connect-src ${connect.join(" ")}`,
+        `frame-src ${frame.join(" ")}`,
+        `base-uri ${base.join(" ")}`,
+        "object-src 'none'",
+        // form-action does NOT fall back to default-src — omitting it left
+        // form submissions (the sandbox grants allow-forms) free to target
+        // any origin at all, a live exfiltration channel a compromised or
+        // malicious view's HTML could use regardless of the CSP above. No
+        // legitimate MCP Apps view submits a real HTML form (tool calls go
+        // through postMessage, not form POSTs), so this is never expected
+        // to need relaxing per-resource the way the others above are.
+        "form-action 'none'",
+      ].join("; ");
+      return `<meta http-equiv="Content-Security-Policy" content="${policy}">`;
     },
 
     // -- slash commands ----------------------------------------------------
@@ -2570,6 +3212,25 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
 //   - JSON string → parse it
 //   - anything else → wrap under _raw so the UI has *something* to render
 //     (better than the old `String(obj)` which produced "[object Object]").
+// resolveAppToolName maps a bare tool name an MCP App's own script asks for
+// (it's written host-agnostic, so it only knows its own un-namespaced name,
+// e.g. "spin_wheel") back to the name this host actually knows it by
+// (e.g. "dashboard__spin_wheel", when the tool was federated from a remote
+// server under the "dashboard" namespace). Without this, an app calling
+// itself — or a sibling tool in the same namespace, like a "claim" button
+// calling a separate "claim_prize" tool — gets "unknown tool" from the host
+// because the namespace prefix federation adds is invisible to the app.
+// hostToolName is the namespaced name the CURRENT tool call is known by
+// (call.name); if it carries no "__" separator, the tool wasn't namespaced
+// (native or unnamespaced-remote), so the requested name is used verbatim.
+function resolveAppToolName(hostToolName, requestedName) {
+  const sep = "__";
+  const idx = hostToolName.indexOf(sep);
+  if (idx < 0) return requestedName;
+  const prefix = hostToolName.slice(0, idx + sep.length);
+  return requestedName.startsWith(prefix) ? requestedName : prefix + requestedName;
+}
+
 function safeParseArgs(raw) {
   if (raw == null) return {};
   if (typeof raw === "object") return raw;

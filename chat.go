@@ -104,7 +104,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// send tool definitions or a disabled list — it only handles the
 	// approval flow (Allow / Always Allow / Deny) when tool calls come
 	// back. Tool enable/disable is managed at the MCP server level.
+	//
+	// FilterToolsForModel drops any tool whose _meta.ui.visibility excludes
+	// "model" (an MCP Apps app-only action tool, e.g. a form submission) —
+	// per the extension's spec, those must never reach the agent's own tool
+	// list, even though Host.ListTools itself returns every tool.
 	tools, _ := s.host.ListTools(r.Context())
+	tools = FilterToolsForModel(tools)
 
 	// Inject the virtual skill-retrieval tool when skill:// resources
 	// exist. Server-side only — not in any user-visible tool list.

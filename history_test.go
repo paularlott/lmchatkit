@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	mcplib "github.com/paularlott/mcp"
 )
 
 // memoryHistoryTestStore is a minimal HistoryStore for testing the
@@ -99,6 +101,76 @@ func TestConversationCRUD(t *testing.T) {
 	// Verify gone
 	if _, err := store.Get(context.Background(), "conv-1"); err == nil {
 		t.Fatal("conversation should be deleted")
+	}
+}
+
+// TestConversationPersistsToolMessageMCPAppsFields proves a tool-role
+// message's is_error/structured_content/ui fields survive a full save/load
+// round trip through the same PUT/GET handlers the browser uses — this is
+// what lets the frontend rebuild an MCP Apps view after navigating away
+// from chat and back, without re-invoking the tool (see chat.js's
+// normalizeMessages rehydration pass).
+func TestConversationPersistsToolMessageMCPAppsFields(t *testing.T) {
+	store := &memoryHistoryTestStore{data: make(map[string]*StoredConversation)}
+	s := newTestServer(t, &fakeHost{})
+	s.cfg.History = store
+
+	conv := StoredConversation{
+		ConversationSummary: ConversationSummary{ID: "conv-2", Title: "Spin", PersonaID: "default", Model: "m1"},
+		Messages: []Message{
+			{Role: RoleUser, Content: "spin the wheel"},
+			{
+				Role:    RoleAssistant,
+				Content: "",
+				ToolCalls: []ToolCall{
+					{ID: "call-1", Name: "spin_wheel", Arguments: json.RawMessage(`{}`)},
+				},
+			},
+			{
+				Role:              RoleTool,
+				Content:           `{"prize":"Gift Card"}`,
+				ToolCallID:        "call-1",
+				ToolName:          "spin_wheel",
+				IsError:           false,
+				StructuredContent: map[string]any{"prize": "Gift Card"},
+				UI:                &mcplib.UIToolMeta{ResourceURI: "ui://prize-wheel/wheel.html"},
+			},
+		},
+	}
+	body, _ := json.Marshal(conv)
+	req := httptest.NewRequest(http.MethodPut, "/chat/api/conversations/conv-2", strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	s.handleConversation(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT: want 200 got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/chat/api/conversations/conv-2", nil)
+	rec = httptest.NewRecorder()
+	s.handleConversation(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET: want 200 got %d", rec.Code)
+	}
+	var got StoredConversation
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Messages) != 3 {
+		t.Fatalf("expected 3 messages, got %d: %+v", len(got.Messages), got.Messages)
+	}
+	toolMsg := got.Messages[2]
+	if toolMsg.Role != RoleTool || toolMsg.ToolCallID != "call-1" {
+		t.Fatalf("expected the tool message at index 2, got: %+v", toolMsg)
+	}
+	if toolMsg.IsError {
+		t.Error("IsError should have round-tripped as false")
+	}
+	sc, ok := toolMsg.StructuredContent.(map[string]any)
+	if !ok || sc["prize"] != "Gift Card" {
+		t.Errorf("StructuredContent = %+v, want {prize: Gift Card}", toolMsg.StructuredContent)
+	}
+	if toolMsg.UI == nil || toolMsg.UI.ResourceURI != "ui://prize-wheel/wheel.html" {
+		t.Errorf("UI = %+v, want ResourceURI ui://prize-wheel/wheel.html", toolMsg.UI)
 	}
 }
 

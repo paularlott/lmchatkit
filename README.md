@@ -10,6 +10,7 @@ Built for — and extracted from — `paularlott/llmrouter`, with the contract s
 - **Persona loading** from a watched TOML directory (`system_prompt`, `default_model`, `[params]` table). Hot-reloads on file change. A built-in `Default` persona is always offered even when the dir is empty.
 - **Slash commands** from a watched markdown directory. `help.md` → `/help`. `$ARGUMENTS` in the body is spliced with whatever the user typed after the command.
 - **MCP pass-through** for tools, prompts, and resources via the `Host` interface — the host decides where they come from.
+- **MCP Apps rendering**: a tool result linked to a `ui://` resource ([SEP-1865](https://github.com/modelcontextprotocol/ext-apps)) mounts in a sandboxed, auto-resizing iframe instead of plain text — no host code beyond the `Host` interface's existing `CallTool`/`ReadResource`.
 - **Tool-call confirmation flow** with per-session auto-allow, persisted in browser `sessionStorage`. The server owns the tool list; the browser only handles approval (Allow / Always Allow / Deny).
 - **Bundles its own HTML/CSS/JS** — the host just calls `Mount(mux)`. The frontend reuses the host's bundled Alpine + Tailwind; lmchatkit doesn't ship a copy.
 - **Auth is host-owned** — pass an `AuthMiddleware` in `Config` and it wraps every lmchatkit handler.
@@ -179,7 +180,7 @@ That registers:
 | `GET /chat/api/commands`           | Slash-command list (incl. rendered markdown body)  |
 | `GET /chat/api/models`             | Models from `Host.Models`                          |
 | `POST /chat/api/chat`              | Streaming completion (SSE response)                |
-| `POST /chat/api/tools/call`        | Execute one tool (after user approval)             |
+| `POST /chat/api/tools/call`        | Execute one tool (after user approval, or `source: "app"` from a mounted view — see [MCP Apps](#mcp-apps-rendering-interactive-tool-uis)) |
 | `GET /chat/api/prompts`            | Prompts from `Host.ListPrompts`                    |
 | `POST /chat/api/prompts/get`       | Render a prompt                                    |
 | `GET /chat/api/resources`          | Resources (static + templates) from `Host`         |
@@ -212,6 +213,24 @@ The server owns the tool list entirely. On each `/api/chat` request, the server 
 This protocol is intentionally **not** OpenAI-shaped — the host's `Complete` implementation is free to call OpenAI, Anthropic, a local llama.cpp, or anything else. The reference implementation in `llmrouter` does a loopback HTTP call to its own `/v1/chat/completions` and translates OpenAI's SSE format into lmchatkit events (including `delta.reasoning_content` / `delta.reasoning` → `EventReasoning`).
 
 The chat request body is minimal — `{model, persona_id, messages, params}`. The server derives the system prompt from the persona (looked up by `persona_id` in the in-memory persona cache), builds the tool list from `Host.ListTools`, and injects virtual tools (`lmchatkit__get_skill`). The browser never sends system messages or tool definitions.
+
+## MCP Apps (rendering interactive tool UIs)
+
+When a tool result's `ui` field carries a `resourceUri` — [SEP-1865](https://github.com/modelcontextprotocol/ext-apps), the "MCP Apps" extension — the frontend renders that tool call's linked `ui://` resource instead of (or alongside) its plain-text result. No `Host` interface change is needed: `ToolResult.UI` and `ResourceResult.UI` ride along on the existing `CallTool`/`ReadResource` methods, so any host whose backing MCP server declares `_meta.ui` on a tool gets this for free.
+
+### How it works
+
+1. `executeToolCall` sees `data.ui.resourceUri` on a `POST /api/tools/call` response and fetches that resource via the existing `POST /api/resources/read`; the fetched content is stored on `call.appResource`.
+2. Once `call.appResource` resolves, the template mounts a container element, whose `x-effect` calls `mountAppView(call, container)` (`web/src/chat.js`) — this builds a CSP `<meta>` tag from the resource's `ui.csp` hints, injects it into the HTML, and renders it into a `<iframe sandbox="allow-scripts allow-forms">` via `srcdoc`.
+3. `mountAppView` then plays the **host** side of the extension's `postMessage` protocol: it replies to the view's `ui/initialize` with `hostInfo`/`hostCapabilities`/`hostContext` (including `containerDimensions: { maxHeight: 700 }`, letting the view size itself up to that cap instead of the host guessing a fixed height); after `ui/notifications/initialized` it pushes `ui/notifications/tool-input` (the call's arguments) and `ui/notifications/tool-result` (`content`/`structuredContent`/`isError`); and it proxies any further `tools/call` / `resources/read` the view sends to this server's own `/api/tools/call` / `/api/resources/read` routes and relays the reply.
+4. The view reports its own content height via `ui/notifications/size-changed`; `mountAppView` applies it directly to the iframe's `style.height`, so the card grows or shrinks to fit instead of a fixed guess. Only `height` is applied — `width` stays under the iframe's own `w-full` CSS, deliberately, to avoid a resize feedback loop with content that itself reacts to container width (e.g. a Chart.js canvas with `responsive: true`).
+5. A tool call an app-only view makes itself (`resolveAppToolName` maps its bare tool name to this call's own `namespace__`-prefixed one, so an app's own script doesn't need to know the federation prefix) round-trips through the same `/api/tools/call` route as a model-initiated call, tagged `source: "app"`. It does **not** go through the model-call approval dialog — an app-driven action (a form submission, a "claim" button) executes as soon as the user interacts with the mounted view, the same way clicking a button in any other web app doesn't ask "are you sure" a second time. What *is* enforced, server-side, on every call regardless of source: [MCP Apps visibility](https://github.com/modelcontextprotocol/ext-apps) (`_meta.ui.visibility`) — a `source: "app"` call may only reach a tool whose visibility includes `"app"`, and a model-approved call may only reach one whose visibility includes `"model"` (`handleCallTool`'s `toolVisibilityAllows`, checked against `Host.ListTools`' full, unfiltered result — not the model-facing list below, which already excludes app-only tools).
+6. `Host.ListTools` itself returns every tool regardless of visibility (needed for step 5's lookup); the tool list actually sent to the model goes through `FilterToolsForModel` first, which drops anything whose visibility excludes `"model"` — an app-only action tool is never offered to (or callable by) the model in the first place.
+7. `call.ui`/`call.structuredContent`/`call.appResource` persist on the stored `call` object (same mechanism as `call.result`), so reloading the page or switching conversations remounts the same app deterministically instead of losing it.
+
+A note on the trust model: `source: "app"` and `via` are protocol data the *caller* supplies, not authentication — they're honest when they arrive through the view bridge (the bridge hardcodes both; the view can't influence them through `postMessage`), but a direct HTTP client with page credentials could set them to anything. The layers that actually contain a malicious view are structural: the iframe is `srcdoc` with an opaque origin (no `allow-same-origin`, so no access to host DOM/cookies/storage) and a CSP built from the server's declared domains only, and cross-origin `fetch` from the view to `/api/*` fails preflight (no CORS headers). The role/ownership checks narrow what a *spec-conforming* view can reach; the sandbox is what bounds a non-conforming one. Put a real authentication layer in front of `Mount`'s routes for anything exposed beyond localhost — `source`/`via` checking is not one.
+
+See the [MCP Apps guide](https://github.com/paularlott/mcp/blob/main/docs/guides/mcp-apps.md) in `paularlott/mcp` for the server-side half of the contract (`_meta.ui`, CSP metadata, `containerDimensions`/`size-changed`), and `paularlott/mcp`'s `examples/mcp-app-host-harness` for a minimal standalone implementation of the same host-side bridge outside of lmchatkit.
 
 ## Personas
 

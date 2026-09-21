@@ -12,6 +12,8 @@ package lmchatkit
 import (
 	"context"
 	"encoding/json"
+
+	mcplib "github.com/paularlott/mcp"
 )
 
 // Role identifies the speaker of a chat message. Mirrors OpenAI's role names
@@ -23,7 +25,7 @@ const (
 	RoleSystem    Role = "system"
 	RoleUser      Role = "user"
 	RoleAssistant Role = "assistant"
-	RoleTool       Role = "tool"
+	RoleTool      Role = "tool"
 )
 
 // Message is one turn in a conversation. Content is normally a string, but
@@ -42,15 +44,26 @@ const (
 // when saving/loading conversations from the history store. With omitempty,
 // an empty assistant message would lose its "content" key entirely, and
 // on reload the browser would see `undefined` instead of `""`.
+//
+// IsError, StructuredContent, and UI are meaningful only on a RoleTool
+// message (the message recording one tool call's result). They mirror the
+// same-named fields on ToolResult, persisted here so the frontend can
+// reconstruct a tool call's full display — including re-mounting an MCP
+// Apps view — from a reloaded conversation, without re-invoking the tool
+// itself (which may not be idempotent; re-running it could show a
+// different result than what actually happened, or double a side effect).
 type Message struct {
-	ID         string                 `json:"id,omitempty"`
-	Role       Role                   `json:"role"`
-	Content    any                    `json:"content"`
-	Thinking   string                 `json:"thinking,omitempty"`
-	Info       map[string]interface{} `json:"info,omitempty"`
-	ToolCalls  []ToolCall             `json:"tool_calls,omitempty"`
-	ToolCallID string                 `json:"tool_call_id,omitempty"`
-	ToolName   string                 `json:"tool_name,omitempty"`
+	ID                string                 `json:"id,omitempty"`
+	Role              Role                   `json:"role"`
+	Content           any                    `json:"content"`
+	Thinking          string                 `json:"thinking,omitempty"`
+	Info              map[string]interface{} `json:"info,omitempty"`
+	ToolCalls         []ToolCall             `json:"tool_calls,omitempty"`
+	ToolCallID        string                 `json:"tool_call_id,omitempty"`
+	ToolName          string                 `json:"tool_name,omitempty"`
+	IsError           bool                   `json:"is_error,omitempty"`
+	StructuredContent any                    `json:"structured_content,omitempty"`
+	UI                *mcplib.UIToolMeta     `json:"ui,omitempty"`
 }
 
 // ToolCall is a single tool invocation requested by the model. Arguments is
@@ -64,26 +77,77 @@ type ToolCall struct {
 
 // Model describes one model the chat user can pick from.
 type Model struct {
-	ID      string `json:"id"`
-	Label   string `json:"label,omitempty"`   // human-friendly label; falls back to ID
+	ID       string `json:"id"`
+	Label    string `json:"label,omitempty"`    // human-friendly label; falls back to ID
 	Provider string `json:"provider,omitempty"` // optional source tag for the UI
 }
 
 // Tool describes one MCP tool exposed to the chat. InputSchema is the JSON
 // schema for arguments (as exposed by MCP tools/list); the frontend uses it
 // to render argument hints when confirming a tool call.
+//
+// Visibility is the tool's _meta.ui.visibility (per the MCP Apps extension,
+// SEP-1865): who may call it — "model" (the agent), "app" (a mounted view),
+// or both. Nil/empty means both, per the spec's default. ListTools returns
+// every tool regardless of visibility (callers needing the model-facing
+// subset use [FilterToolsForModel]); it's carried here so the /api/tools/call
+// handler can enforce it without a second round trip to the MCP server.
 type Tool struct {
 	Name        string                 `json:"name"`
 	Description string                 `json:"description,omitempty"`
 	InputSchema map[string]interface{} `json:"input_schema,omitempty"`
+	Visibility  []string               `json:"-"`
+}
+
+// visibilityAllows reports whether visibility (a Tool's _meta.ui.visibility,
+// or nil) permits the given role ("model" or "app"). Per the MCP Apps spec,
+// an empty/nil visibility defaults to both.
+func visibilityAllows(visibility []string, role string) bool {
+	if len(visibility) == 0 {
+		return true
+	}
+	for _, v := range visibility {
+		if v == role {
+			return true
+		}
+	}
+	return false
+}
+
+// FilterToolsForModel returns the subset of tools visible to the model,
+// per the MCP Apps extension's tools/list MUST: a tool whose
+// _meta.ui.visibility doesn't include "model" (e.g. an app-only action tool
+// like a form submission) must never reach the agent's own tool list, even
+// though it's still a real, callable tool for a mounted view. Hosts building
+// the LLM-facing tool array from [Host.ListTools]'s result MUST filter
+// through this first — StandardHost's ListTools deliberately returns every
+// tool unfiltered, since the same list also backs the /api/tools/call
+// visibility check for app-initiated calls, which needs the app-only tools.
+func FilterToolsForModel(tools []Tool) []Tool {
+	out := make([]Tool, 0, len(tools))
+	for _, t := range tools {
+		if visibilityAllows(t.Visibility, "model") {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // ToolResult is the outcome of a tool call. Content is the model-facing text
 // (typically the MCP tool response). isError flags the result as an error so
 // the model knows not to treat Content as a successful payload.
+//
+// StructuredContent and UI are frontend-only extras, not sent to the model:
+// StructuredContent is the tool response's raw structuredContent (if any),
+// which Content's text-only flattening otherwise discards entirely.
+// UI is the called tool's own _meta.ui (per the MCP Apps extension,
+// SEP-1865), when the underlying MCP server declared one — the frontend uses
+// it to decide whether to render an interactive view for this result.
 type ToolResult struct {
-	Content  string `json:"content"`
-	IsError  bool   `json:"is_error,omitempty"`
+	Content           string             `json:"content"`
+	IsError           bool               `json:"is_error,omitempty"`
+	StructuredContent any                `json:"structured_content,omitempty"`
+	UI                *mcplib.UIToolMeta `json:"ui,omitempty"`
 }
 
 // PromptArgument is one named argument a prompt accepts.
@@ -95,9 +159,9 @@ type PromptArgument struct {
 
 // Prompt is one MCP prompt exposed to the chat.
 type Prompt struct {
-	Name        string            `json:"name"`
-	Description string            `json:"description,omitempty"`
-	Arguments   []PromptArgument  `json:"arguments,omitempty"`
+	Name        string           `json:"name"`
+	Description string           `json:"description,omitempty"`
+	Arguments   []PromptArgument `json:"arguments,omitempty"`
 }
 
 // PromptMessage is one message produced by rendering a prompt.
@@ -124,11 +188,19 @@ type Resource struct {
 
 // ResourceResult is the content of a read resource. Text is used for textual
 // content; Blob carries base64-encoded binary content.
+//
+// UI carries the resource's own _meta.ui (per the MCP Apps extension,
+// SEP-1865) — CSP/permissions/domain/prefersBorder hints a compliant host
+// applies before rendering the content in a sandboxed iframe. Note its JSON
+// field names (e.g. "resourceUri", "connectDomains") are camelCase, unlike
+// the rest of this package's snake_case convention — this reuses the mcp
+// library's own wire type directly rather than duplicating it.
 type ResourceResult struct {
-	URI      string `json:"uri"`
-	Text     string `json:"text,omitempty"`
-	Blob     string `json:"blob,omitempty"`
-	MimeType string `json:"mime_type,omitempty"`
+	URI      string                 `json:"uri"`
+	Text     string                 `json:"text,omitempty"`
+	Blob     string                 `json:"blob,omitempty"`
+	MimeType string                 `json:"mime_type,omitempty"`
+	UI       *mcplib.UIResourceMeta `json:"ui,omitempty"`
 }
 
 // CompleteRequest is the host-facing request to stream a chat completion.
@@ -148,32 +220,32 @@ type CompleteRequest struct {
 type EventType string
 
 const (
-	EventDelta      EventType = "delta"       // partial assistant text
-	EventReasoning  EventType = "reasoning"   // partial reasoning/thinking text (separate from visible content)
-	EventToolCall   EventType = "tool_call"   // model requested a tool call; frontend must confirm + execute then resubmit
-	EventDone       EventType = "done"        // stream complete; carry usage/finish_reason
-	EventError      EventType = "error"       // stream failed
+	EventDelta     EventType = "delta"     // partial assistant text
+	EventReasoning EventType = "reasoning" // partial reasoning/thinking text (separate from visible content)
+	EventToolCall  EventType = "tool_call" // model requested a tool call; frontend must confirm + execute then resubmit
+	EventDone      EventType = "done"      // stream complete; carry usage/finish_reason
+	EventError     EventType = "error"     // stream failed
 )
 
 // FinishReason explains why the stream ended.
 type FinishReason string
 
 const (
-	FinishStop        FinishReason = "stop"
-	FinishToolCalls   FinishReason = "tool_calls"
-	FinishLength      FinishReason = "length"
+	FinishStop      FinishReason = "stop"
+	FinishToolCalls FinishReason = "tool_calls"
+	FinishLength    FinishReason = "length"
 )
 
 // Event is one streamed server-sent event in the chat protocol. Type
 // determines which fields are meaningful.
 type Event struct {
-	Type         EventType     `json:"type"`
-	Delta        string        `json:"delta,omitempty"`
-	Reasoning    string        `json:"reasoning,omitempty"` // carries EventReasoning fragments
-	ToolCall     *ToolCall     `json:"tool_call,omitempty"`
-	FinishReason FinishReason  `json:"finish_reason,omitempty"`
-	Usage        *Usage        `json:"usage,omitempty"`
-	Error        string        `json:"error,omitempty"`
+	Type         EventType    `json:"type"`
+	Delta        string       `json:"delta,omitempty"`
+	Reasoning    string       `json:"reasoning,omitempty"` // carries EventReasoning fragments
+	ToolCall     *ToolCall    `json:"tool_call,omitempty"`
+	FinishReason FinishReason `json:"finish_reason,omitempty"`
+	Usage        *Usage       `json:"usage,omitempty"`
+	Error        string       `json:"error,omitempty"`
 }
 
 // Usage reports token counts for a completion, if known.
@@ -230,6 +302,36 @@ type Host interface {
 // always reflects current state without needing a watcher.
 type PersonaSource interface {
 	Personas(ctx context.Context) ([]Persona, error)
+}
+
+// SourceScopedHost is an optional interface a Host can implement to expose
+// which underlying MCP server each tool/resource belongs to. lmchatkit's
+// /api/tools/call and /api/resources/read handlers use it, when present, to
+// enforce that a mounted MCP Apps view may only reach a tool or resource
+// belonging to the same server as the tool that mounted it — visibility
+// (_meta.ui.visibility) alone can't provide this: two different federated
+// servers connected without namespace prefixes can expose same-shaped
+// "app"-visible tools/resources under names that collide or simply aren't
+// distinguishable by name alone.
+//
+// A Host that aggregates only a single, non-federated MCP server (no
+// cross-server ambiguity is possible) need not implement this — lmchatkit
+// falls back to allowing the call/read unchecked (beyond the existing
+// visibility check) when the Host doesn't implement it.
+type SourceScopedHost interface {
+	// ToolSource returns an opaque, stable identifier for the MCP server
+	// the named tool belongs to ("" for a tool the host serves natively,
+	// as opposed to a federated remote), and whether name is a recognized
+	// tool at all. Implementations must fail closed: an error resolving
+	// the tool must return ok == false, never a guessed source.
+	ToolSource(ctx context.Context, name string) (source string, ok bool)
+
+	// ReadResourceFromSource reads uri restricted to the server identified
+	// by source (as returned by ToolSource): "" reads only natively-served
+	// resources, a non-empty source reads only from that one remote server
+	// — never falling through to any other server the way an unscoped
+	// ReadResource might.
+	ReadResourceFromSource(ctx context.Context, source, uri string) (ResourceResult, error)
 }
 
 // SystemPromptAugmenter is an optional interface a Host can implement to

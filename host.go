@@ -218,6 +218,7 @@ func emit(ctx context.Context, events chan<- Event, ev Event) error {
 		return ctx.Err()
 	}
 }
+
 // StandardHost is a ready-to-use [Host] implementation for apps that:
 //   - Talk to an OpenAI-compatible /v1/chat/completions endpoint
 //   - Expose MCP tools/prompts/resources via an *mcp.Server
@@ -267,6 +268,7 @@ type StandardHost struct {
 // Compile-time checks.
 var _ Host = (*StandardHost)(nil)
 var _ SystemPromptAugmenter = (*StandardHost)(nil)
+var _ SourceScopedHost = (*StandardHost)(nil)
 
 // AugmentSystemPrompt satisfies SystemPromptAugmenter. If the function field
 // is nil, the prompt passes through unchanged.
@@ -330,10 +332,15 @@ func (h *StandardHost) ListTools(ctx context.Context) ([]Tool, error) {
 				_ = json.Unmarshal(b, &schema)
 			}
 		}
+		var visibility []string
+		if ui := extractUIMeta[mcplib.UIToolMeta](t.Meta); ui != nil {
+			visibility = ui.Visibility
+		}
 		out = append(out, Tool{
 			Name:        t.Name,
 			Description: t.Description,
 			InputSchema: schema,
+			Visibility:  visibility,
 		})
 	}
 	return out, nil
@@ -357,7 +364,51 @@ func (h *StandardHost) CallTool(ctx context.Context, name string, arguments json
 		}
 		return ToolResult{}, err
 	}
-	return ToolResult{Content: mcpToolResponseText(resp)}, nil
+	return ToolResult{
+		Content:           mcpToolResponseText(resp),
+		StructuredContent: resp.StructuredContent,
+		UI:                extractUIMeta[mcplib.UIToolMeta](toolMetaByName(srv.ListToolsWithContext(ctx), name)),
+	}, nil
+}
+
+// toolMetaByName finds a tool's own _meta map by name from a tools/list
+// snapshot. Returns nil if the tool isn't found or carries no metadata.
+func toolMetaByName(tools []mcplib.MCPTool, name string) map[string]any {
+	for _, t := range tools {
+		if t.Name == name {
+			return t.Meta
+		}
+	}
+	return nil
+}
+
+// extractUIMeta pulls the "ui" entry out of an MCP _meta map into the
+// requested concrete type (mcplib.UIToolMeta or mcplib.UIResourceMeta).
+//
+// A native (in-process) tool/resource stores this value as the concrete
+// struct type directly (set via ToolBuilder.Meta/UIResource), but a
+// federated one — round-tripped through JSON when fetched from a remote MCP
+// server — always deserializes it as map[string]any, never the original
+// struct, since that's how encoding/json fills an `any`-typed field. A plain
+// type assertion would silently miss the federated case, so this always goes
+// through a JSON marshal/unmarshal, which normalizes both shapes.
+func extractUIMeta[T any](meta map[string]any) *T {
+	if meta == nil {
+		return nil
+	}
+	raw, ok := meta["ui"]
+	if !ok || raw == nil {
+		return nil
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var out T
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil
+	}
+	return &out
 }
 
 func (h *StandardHost) ListPrompts(ctx context.Context) ([]Prompt, error) {
@@ -427,13 +478,45 @@ func (h *StandardHost) ReadResource(ctx context.Context, uri string) (ResourceRe
 	if err != nil {
 		return ResourceResult{}, err
 	}
+	return resourceResultFrom(uri, resp), nil
+}
+
+// ToolSource satisfies [SourceScopedHost], delegating to the underlying
+// *mcp.Server's own ToolSource.
+func (h *StandardHost) ToolSource(ctx context.Context, name string) (string, bool) {
+	srv := h.mcpServer(ctx)
+	if srv == nil {
+		return "", false
+	}
+	return srv.ToolSource(name)
+}
+
+// ReadResourceFromSource satisfies [SourceScopedHost], delegating to the
+// underlying *mcp.Server's own ReadResourceFrom.
+func (h *StandardHost) ReadResourceFromSource(ctx context.Context, source, uri string) (ResourceResult, error) {
+	srv := h.mcpServer(ctx)
+	if srv == nil {
+		return ResourceResult{}, fmt.Errorf("MCP server not available")
+	}
+	resp, err := srv.ReadResourceFrom(ctx, source, uri)
+	if err != nil {
+		return ResourceResult{}, err
+	}
+	return resourceResultFrom(uri, resp), nil
+}
+
+// resourceResultFrom converts an MCP ReadResource response into the
+// frontend-facing ResourceResult shape — shared by ReadResource and
+// ReadResourceFromSource.
+func resourceResultFrom(uri string, resp *mcplib.ResourceResponse) ResourceResult {
 	out := ResourceResult{URI: uri}
 	if len(resp.Contents) > 0 {
 		out.Text = resp.Contents[0].Text
 		out.Blob = resp.Contents[0].Blob
 		out.MimeType = resp.Contents[0].MimeType
+		out.UI = extractUIMeta[mcplib.UIResourceMeta](resp.Contents[0].Meta)
 	}
-	return out, nil
+	return out
 }
 
 // mcpServer resolves the MCP server for this request. Returns nil if no
