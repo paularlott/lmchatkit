@@ -148,6 +148,85 @@ func TestStandardHostCallTool_FederatedUITool(t *testing.T) {
 	}
 }
 
+// TestStandardHostCallTool_DiscoverableUIToolViaExecuteTool reproduces a real
+// bug: a discoverable (search-only) tool is never called by its own name —
+// the model calls execute_tool with {"name": ..., "parameters": ...} — so a
+// naive ToolResult.UI lookup keyed on the outer call name ("execute_tool")
+// never finds the tool's _meta.ui, and a discoverable MCP Apps tool would
+// silently never render.
+func TestStandardHostCallTool_DiscoverableUIToolViaExecuteTool(t *testing.T) {
+	srv := mcplib.NewServer("test", "0.0.1")
+	srv.RegisterTool(
+		mcplib.NewTool("spin_wheel", "Spin the prize wheel").
+			UIResource(testUIResourceURI, "model", "app").
+			Discoverable(),
+		func(ctx context.Context, req *mcplib.ToolRequest) (*mcplib.ToolResponse, error) {
+			return mcplib.NewToolResponseText("Sticker Pack"), nil
+		},
+	)
+	h := &StandardHost{MCPServer: func(ctx context.Context) *mcplib.Server { return srv }}
+
+	args, _ := json.Marshal(map[string]any{"name": "spin_wheel", "parameters": map[string]any{}})
+	res, err := h.CallTool(context.Background(), mcplib.ExecuteToolName, args)
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.Content != "Sticker Pack" {
+		t.Errorf("Content = %q, want %q (execute_tool must still dispatch to the real tool)", res.Content, "Sticker Pack")
+	}
+	if res.UI == nil {
+		t.Fatal("expected ToolResult.UI to be populated for a discoverable UI-linked tool called via execute_tool")
+	}
+	if res.UI.ResourceURI != testUIResourceURI {
+		t.Errorf("ResourceURI = %q, want %q", res.UI.ResourceURI, testUIResourceURI)
+	}
+}
+
+// TestStandardHostCallTool_ExecuteToolLegacyArgumentsKey covers the
+// "arguments" key handleExecuteTool falls back to when "parameters" is
+// absent — resolvedToolName only needs the "name" key, but this pins down
+// that the fallback key doesn't somehow break name resolution.
+func TestStandardHostCallTool_ExecuteToolLegacyArgumentsKey(t *testing.T) {
+	srv := mcplib.NewServer("test", "0.0.1")
+	srv.RegisterTool(
+		mcplib.NewTool("spin_wheel", "Spin the prize wheel").
+			UIResource(testUIResourceURI).
+			Discoverable(),
+		func(ctx context.Context, req *mcplib.ToolRequest) (*mcplib.ToolResponse, error) {
+			return mcplib.NewToolResponseText("ok"), nil
+		},
+	)
+	h := &StandardHost{MCPServer: func(ctx context.Context) *mcplib.Server { return srv }}
+
+	args, _ := json.Marshal(map[string]any{"name": "spin_wheel", "arguments": map[string]any{}})
+	res, err := h.CallTool(context.Background(), mcplib.ExecuteToolName, args)
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.UI == nil || res.UI.ResourceURI != testUIResourceURI {
+		t.Errorf("expected UI.ResourceURI = %q, got %+v", testUIResourceURI, res.UI)
+	}
+}
+
+// TestStandardHostCallTool_ExecuteToolMissingNameNoUI covers a malformed
+// execute_tool call (missing "name") — must not panic and must not report a
+// bogus UI link.
+func TestStandardHostCallTool_ExecuteToolMissingNameNoUI(t *testing.T) {
+	srv := buildTestMCPServer()
+	h := &StandardHost{MCPServer: func(ctx context.Context) *mcplib.Server { return srv }}
+
+	args, _ := json.Marshal(map[string]any{})
+	res, err := h.CallTool(context.Background(), mcplib.ExecuteToolName, args)
+	// handleExecuteTool returns a text response ("Tool name is required"),
+	// not an error — CallTool must reflect that, not panic or fabricate a UI.
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.UI != nil {
+		t.Errorf("expected no UI for a malformed execute_tool call, got %+v", res.UI)
+	}
+}
+
 // TestStandardHostListTools_PopulatesVisibility and
 // TestFilterToolsForModel_DropsAppOnlyTools together pin down the MCP Apps
 // visibility enforcement path: ListTools must expose each tool's

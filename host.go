@@ -364,11 +364,40 @@ func (h *StandardHost) CallTool(ctx context.Context, name string, arguments json
 		}
 		return ToolResult{}, err
 	}
+
+	// The lookup below needs mcplib.WithShowAllTools: a discoverable
+	// (search-only) tool is by design excluded from ListToolsWithContext's
+	// normal result — that's what "discoverable" means — but its _meta.ui
+	// still needs to be found here. Show-all only affects this internal
+	// metadata lookup, not what was actually executed above or what any
+	// other caller sees.
+	toolsForMeta := srv.ListToolsWithContext(mcplib.WithShowAllTools(ctx))
 	return ToolResult{
 		Content:           mcpToolResponseText(resp),
 		StructuredContent: resp.StructuredContent,
-		UI:                extractUIMeta[mcplib.UIToolMeta](toolMetaByName(srv.ListToolsWithContext(ctx), name)),
+		UI:                extractUIMeta[mcplib.UIToolMeta](toolMetaByName(toolsForMeta, resolvedToolName(name, argsMap))),
 	}, nil
+}
+
+// resolvedToolName returns the tool name a completed CallTool actually
+// invoked. A discoverable (search-only) tool is never called by name
+// directly — the model (or an app view resolving one of its own discovered
+// tools) calls the built-in execute_tool meta-tool instead, wrapping the
+// real name and arguments as {"name": ..., "parameters"/"arguments": ...}
+// (see mcp.Server.handleExecuteTool). srv.CallTool already dispatches
+// through that wrapper correctly — Content/StructuredContent above are
+// already the real tool's own response — but a lookup keyed on the outer
+// name would search ListTools for a tool literally called "execute_tool",
+// which never carries _meta.ui: a discoverable MCP Apps tool would then
+// silently never render for the caller. This unwraps that one level first.
+func resolvedToolName(name string, args map[string]any) string {
+	if name != mcplib.ExecuteToolName {
+		return name
+	}
+	if inner, ok := args["name"].(string); ok && inner != "" {
+		return inner
+	}
+	return name
 }
 
 // toolMetaByName finds a tool's own _meta map by name from a tools/list
