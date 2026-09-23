@@ -269,6 +269,7 @@ type StandardHost struct {
 var _ Host = (*StandardHost)(nil)
 var _ SystemPromptAugmenter = (*StandardHost)(nil)
 var _ SourceScopedHost = (*StandardHost)(nil)
+var _ AllToolsHost = (*StandardHost)(nil)
 
 // AugmentSystemPrompt satisfies SystemPromptAugmenter. If the function field
 // is nil, the prompt passes through unchanged.
@@ -321,7 +322,22 @@ func (h *StandardHost) ListTools(ctx context.Context) ([]Tool, error) {
 	if srv == nil {
 		return nil, nil
 	}
-	tools := srv.ListToolsWithContext(ctx)
+	return convertMCPTools(srv.ListToolsWithContext(ctx)), nil
+}
+
+// ListAllTools satisfies [AllToolsHost]. It additionally includes
+// discoverable (search-only) tools that ListTools omits from the
+// model-facing list — see mcplib.WithShowAllTools — so toolVisibilityAllows
+// can find a tool an app view calls directly by its real name.
+func (h *StandardHost) ListAllTools(ctx context.Context) ([]Tool, error) {
+	srv := h.mcpServer(ctx)
+	if srv == nil {
+		return nil, nil
+	}
+	return convertMCPTools(srv.ListToolsWithContext(mcplib.WithShowAllTools(ctx))), nil
+}
+
+func convertMCPTools(tools []mcplib.MCPTool) []Tool {
 	out := make([]Tool, 0, len(tools))
 	for _, t := range tools {
 		var schema map[string]interface{}
@@ -343,7 +359,7 @@ func (h *StandardHost) ListTools(ctx context.Context) ([]Tool, error) {
 			Visibility:  visibility,
 		})
 	}
-	return out, nil
+	return out
 }
 
 func (h *StandardHost) CallTool(ctx context.Context, name string, arguments json.RawMessage) (ToolResult, error) {
@@ -510,22 +526,70 @@ func (h *StandardHost) ReadResource(ctx context.Context, uri string) (ResourceRe
 	return resourceResultFrom(uri, resp), nil
 }
 
-// ToolSource satisfies [SourceScopedHost], delegating to the underlying
-// *mcp.Server's own ToolSource.
+// SourcedToolProvider is an optional interface a request-scoped
+// mcplib.ToolProvider (attached via mcplib.WithToolProviders) can implement
+// to identify which underlying MCP server one of its tools came from, and to
+// read a resource restricted to that one server. Without this, StandardHost's
+// SourceScopedHost support (ToolSource/ReadResourceFromSource) only sees
+// servers registered directly on the *mcp.Server via RegisterRemoteServer* —
+// mcp.Server's own ToolSource/ReadResourceFrom have no visibility into
+// context-attached providers at all. A host with per-user/per-request
+// federated servers (e.g. each user's own configured remote MCP servers)
+// needs this to support MCP Apps' cross-server ownership enforcement for
+// those providers; see [SourceScopedHost] for why that enforcement exists.
+type SourcedToolProvider interface {
+	mcplib.ToolProvider
+	// ToolSource returns an opaque, stable identifier for the server that
+	// owns name (never "" — that's reserved for natively-served tools per
+	// SourceScopedHost's contract), or ok=false if this provider doesn't
+	// recognize name. Must fail closed: an error resolving the tool returns
+	// ok == false, never a guessed source.
+	ToolSource(ctx context.Context, name string) (source string, ok bool)
+	// ReadResourceFromSource reads uri from the specific server identified
+	// by source (as returned by this same provider's ToolSource), or returns
+	// an error if source isn't one this provider owns.
+	ReadResourceFromSource(ctx context.Context, source, uri string) (*mcplib.ResourceResponse, error)
+}
+
+// ToolSource satisfies [SourceScopedHost]. It checks the underlying
+// *mcp.Server's own ToolSource first (native tools and statically-registered
+// remote servers), then any context-attached [SourcedToolProvider]s.
 func (h *StandardHost) ToolSource(ctx context.Context, name string) (string, bool) {
 	srv := h.mcpServer(ctx)
 	if srv == nil {
 		return "", false
 	}
-	return srv.ToolSource(name)
+	if source, ok := srv.ToolSource(name); ok {
+		return source, true
+	}
+	for _, p := range mcplib.GetToolProviders(ctx) {
+		if sp, ok := p.(SourcedToolProvider); ok {
+			if source, ok := sp.ToolSource(ctx, name); ok {
+				return source, true
+			}
+		}
+	}
+	return "", false
 }
 
-// ReadResourceFromSource satisfies [SourceScopedHost], delegating to the
-// underlying *mcp.Server's own ReadResourceFrom.
+// ReadResourceFromSource satisfies [SourceScopedHost]. It tries any
+// context-attached [SourcedToolProvider]s first (they're the only ones who
+// can resolve a source identifier they themselves handed out via
+// ToolSource), falling back to the underlying *mcp.Server's own
+// ReadResourceFrom for native/statically-registered sources.
 func (h *StandardHost) ReadResourceFromSource(ctx context.Context, source, uri string) (ResourceResult, error) {
 	srv := h.mcpServer(ctx)
 	if srv == nil {
 		return ResourceResult{}, fmt.Errorf("MCP server not available")
+	}
+	for _, p := range mcplib.GetToolProviders(ctx) {
+		sp, ok := p.(SourcedToolProvider)
+		if !ok {
+			continue
+		}
+		if resp, err := sp.ReadResourceFromSource(ctx, source, uri); err == nil {
+			return resourceResultFrom(uri, resp), nil
+		}
 	}
 	resp, err := srv.ReadResourceFrom(ctx, source, uri)
 	if err != nil {

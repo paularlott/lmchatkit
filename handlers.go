@@ -136,15 +136,25 @@ func (s *Server) handleCallTool(w http.ResponseWriter, r *http.Request) {
 }
 
 // toolVisibilityAllows reports whether the named tool's _meta.ui.visibility
-// permits role ("model" or "app"). Looks the tool up in Host.ListTools'
-// full, unfiltered result — chat.go's own model-facing tool list has
+// permits role ("model" or "app"). Looks the tool up in AllToolsHost's full,
+// unfiltered result when the host implements it (falling back to
+// Host.ListTools otherwise) — chat.go's own model-facing tool list has
 // already been through FilterToolsForModel, which would hide an app-only
-// tool from a lookup against it too, defeating the very calls this is meant
-// to allow. Fails closed: a ListTools error or a name it doesn't recognize
-// both deny, rather than letting an unresolvable call fall through as
-// allowed.
+// tool from a lookup against it too, and ListTools alone would hide a
+// discoverable (search-only) tool that an app view calls directly by its
+// real name, defeating the very calls this is meant to allow. Fails closed:
+// a list error or a name it doesn't recognize both deny, rather than letting
+// an unresolvable call fall through as allowed.
 func (s *Server) toolVisibilityAllows(ctx context.Context, name, role string) bool {
-	tools, err := s.host.ListTools(ctx)
+	var (
+		tools []Tool
+		err   error
+	)
+	if all, ok := s.host.(AllToolsHost); ok {
+		tools, err = all.ListAllTools(ctx)
+	} else {
+		tools, err = s.host.ListTools(ctx)
+	}
 	if err != nil {
 		return false
 	}

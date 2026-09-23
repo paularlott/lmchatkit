@@ -2468,7 +2468,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         const resourceResp = await fetch(`${this.prefix}/api/resources/read`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ uri: call.ui.resourceUri, via: call.name }),
+          body: JSON.stringify({ uri: call.ui.resourceUri, via: hostToolNameFor(call) }),
         });
         // A non-OK response (e.g. a 500 from a server error, or a 403 from
         // toolSourceAllows) still has a valid JSON body — {"error": "..."}
@@ -2749,7 +2749,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
-                name: resolveAppToolName(call.name, msg.params.name),
+                name: resolveAppToolName(hostToolNameFor(call), msg.params.name),
                 arguments: msg.params.arguments || {},
                 // Marks this as a call the view made of itself, not a
                 // model-approved one — the server enforces MCP Apps
@@ -2761,7 +2761,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
                 // server (see toolSourceAllows in lmchatkit) — visibility
                 // alone can't stop a view from reaching a same-named tool
                 // on a completely different, unnamespaced federated server.
-                via: call.name,
+                via: hostToolNameFor(call),
               }),
             });
             const toolData = await resp.json();
@@ -2779,7 +2779,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
               // (see toolSourceAllows/handleReadResource in lmchatkit) —
               // otherwise the view could read any resource from any
               // connected server just by knowing its URI.
-              body: JSON.stringify({ uri: msg.params.uri, via: call.name }),
+              body: JSON.stringify({ uri: msg.params.uri, via: hostToolNameFor(call) }),
             });
             const resData = await resp.json();
             if (!resp.ok) throw new Error(resData.error || `resources/read failed (${resp.status})`);
@@ -3220,8 +3220,9 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
 // itself — or a sibling tool in the same namespace, like a "claim" button
 // calling a separate "claim_prize" tool — gets "unknown tool" from the host
 // because the namespace prefix federation adds is invisible to the app.
-// hostToolName is the namespaced name the CURRENT tool call is known by
-// (call.name); if it carries no "__" separator, the tool wasn't namespaced
+// hostToolName is the namespaced name the CURRENT tool call is known by —
+// see hostToolNameFor, which resolves this from call (not always call.name
+// itself); if it carries no "__" separator, the tool wasn't namespaced
 // (native or unnamespaced-remote), so the requested name is used verbatim.
 function resolveAppToolName(hostToolName, requestedName) {
   const sep = "__";
@@ -3229,6 +3230,22 @@ function resolveAppToolName(hostToolName, requestedName) {
   if (idx < 0) return requestedName;
   const prefix = hostToolName.slice(0, idx + sep.length);
   return requestedName.startsWith(prefix) ? requestedName : prefix + requestedName;
+}
+
+// hostToolNameFor returns the real, namespaced tool name that mounted this
+// view. Usually that's just call.name — but a discoverable (search-only)
+// tool is never called by its own name; the model calls the built-in
+// execute_tool meta-tool instead, wrapping the real (already-resolved,
+// already-namespaced) name as call.arguments.name (see mcp.Server's
+// handleExecuteTool and StandardHost.resolvedToolName on the Go side).
+// call.name is then literally "execute_tool", which has no "__" for
+// resolveAppToolName to extract a namespace from — so for that case, use
+// the real name from call.arguments.name instead.
+function hostToolNameFor(call) {
+  if (call.name === "execute_tool" && call.arguments && typeof call.arguments.name === "string") {
+    return call.arguments.name;
+  }
+  return call.name;
 }
 
 function safeParseArgs(raw) {

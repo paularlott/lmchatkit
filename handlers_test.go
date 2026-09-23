@@ -79,6 +79,22 @@ func (h *fakeScopedHost) ReadResourceFromSource(ctx context.Context, source, uri
 
 var _ SourceScopedHost = (*fakeScopedHost)(nil)
 
+// fakeAllToolsHost wraps fakeHost and additionally implements
+// [AllToolsHost], for tests exercising the discoverable-tool visibility gap:
+// allTools includes tools that ListTools (tools) omits, mirroring a
+// discoverable MCP tool that's hidden from the model-facing list but still
+// directly callable by an app view.
+type fakeAllToolsHost struct {
+	*fakeHost
+	allTools []Tool
+}
+
+func (h *fakeAllToolsHost) ListAllTools(ctx context.Context) ([]Tool, error) {
+	return h.allTools, nil
+}
+
+var _ AllToolsHost = (*fakeAllToolsHost)(nil)
+
 // newTestServer wires a lmchatkit Server with no on-disk persona/command dirs.
 func newTestServer(t *testing.T, host Host) *Server {
 	t.Helper()
@@ -254,6 +270,39 @@ func TestHandleCallTool_EnforcesVisibility(t *testing.T) {
 			t.Fatalf("status = %d, want 403: %s", rec.Code, rec.Body.String())
 		}
 	})
+}
+
+// TestHandleCallTool_AppCanReachDiscoverableTool reproduces a real bug: a
+// discoverable (search-only) MCP tool is excluded from Host.ListTools'
+// model-facing result by design, but an app view calls it directly by its
+// real name (chat.js's resolveAppToolName), not through execute_tool. Using
+// plain ListTools for the visibility check made toolVisibilityAllows unable
+// to find the tool at all, denying every app-initiated call to it. A host
+// that also implements AllToolsHost must be consulted instead so the tool's
+// _meta.ui.visibility can be found.
+func TestHandleCallTool_AppCanReachDiscoverableTool(t *testing.T) {
+	host := &fakeAllToolsHost{
+		fakeHost: &fakeHost{
+			// Deliberately empty: this is what ListTools returns for a
+			// discoverable tool — absent, same as the model-facing list.
+			tools: []Tool{},
+			callTool: func(ctx context.Context, name string, args json.RawMessage) (ToolResult, error) {
+				return ToolResult{Content: "ok:" + name}, nil
+			},
+		},
+		allTools: []Tool{
+			{Name: "memory__spin_wheel", Visibility: []string{"model", "app"}},
+		},
+	}
+	s := newTestServer(t, host)
+
+	req := httptest.NewRequest(http.MethodPost, "/chat/api/tools/call", strings.NewReader(
+		`{"name":"memory__spin_wheel","arguments":{},"source":"app"}`))
+	rec := httptest.NewRecorder()
+	s.handleCallTool(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
 }
 
 // TestHandleCallTool_EnforcesSourceOwnership is the regression test for the

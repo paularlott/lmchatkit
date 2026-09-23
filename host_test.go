@@ -182,6 +182,49 @@ func TestStandardHostCallTool_DiscoverableUIToolViaExecuteTool(t *testing.T) {
 	}
 }
 
+// TestStandardHostListAllTools_IncludesDiscoverable pins down the difference
+// between ListTools and ListAllTools: a discoverable (search-only) tool is
+// excluded from the former (the model-facing list, by design — that's what
+// "discoverable" means) but must be present in the latter, which
+// toolVisibilityAllows needs to find a tool an app view calls directly by
+// its real name.
+func TestStandardHostListAllTools_IncludesDiscoverable(t *testing.T) {
+	srv := mcplib.NewServer("test", "0.0.1")
+	srv.RegisterTool(
+		mcplib.NewTool("spin_wheel", "Spin the prize wheel").
+			UIResource(testUIResourceURI, "model", "app").
+			Discoverable(),
+		func(ctx context.Context, req *mcplib.ToolRequest) (*mcplib.ToolResponse, error) {
+			return mcplib.NewToolResponseText("ok"), nil
+		},
+	)
+	h := &StandardHost{MCPServer: func(ctx context.Context) *mcplib.Server { return srv }}
+
+	listed, err := h.ListTools(context.Background())
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	for _, tool := range listed {
+		if tool.Name == "spin_wheel" {
+			t.Fatalf("ListTools unexpectedly included discoverable tool %q", tool.Name)
+		}
+	}
+
+	all, err := h.ListAllTools(context.Background())
+	if err != nil {
+		t.Fatalf("ListAllTools: %v", err)
+	}
+	var found bool
+	for _, tool := range all {
+		if tool.Name == "spin_wheel" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("ListAllTools must include the discoverable tool")
+	}
+}
+
 // TestStandardHostCallTool_ExecuteToolLegacyArgumentsKey covers the
 // "arguments" key handleExecuteTool falls back to when "parameters" is
 // absent — resolvedToolName only needs the "name" key, but this pins down
@@ -282,5 +325,161 @@ func TestFilterToolsForModel_DropsAppOnlyTools(t *testing.T) {
 	}
 	if !names["ping"] || !names["sales_report"] {
 		t.Errorf("expected ping and sales_report in the model-facing list, got %v", names)
+	}
+}
+
+// fakeSourcedProvider is a minimal SourcedToolProvider double: one tool
+// namespaced "remote1__", "owned" by a single opaque source identifier, with
+// a single resource only that source can read.
+type fakeSourcedProvider struct {
+	source      string
+	toolName    string
+	resourceURI string
+	resource    *mcplib.ResourceResponse
+}
+
+func (p *fakeSourcedProvider) GetTools(ctx context.Context) ([]mcplib.MCPTool, error) {
+	return []mcplib.MCPTool{{Name: p.toolName}}, nil
+}
+
+func (p *fakeSourcedProvider) ExecuteTool(ctx context.Context, name string, args map[string]any) (*mcplib.ToolResponse, error) {
+	return nil, mcplib.ErrUnknownTool
+}
+
+func (p *fakeSourcedProvider) ToolSource(ctx context.Context, name string) (string, bool) {
+	if name == p.toolName {
+		return p.source, true
+	}
+	return "", false
+}
+
+func (p *fakeSourcedProvider) ReadResourceFromSource(ctx context.Context, source, uri string) (*mcplib.ResourceResponse, error) {
+	if source != p.source || uri != p.resourceURI {
+		return nil, mcplib.ErrUnknownResource
+	}
+	return p.resource, nil
+}
+
+var _ SourcedToolProvider = (*fakeSourcedProvider)(nil)
+
+// fakePlainProvider implements only mcplib.ToolProvider — no source
+// awareness — standing in for e.g. a script- or method-tools provider
+// alongside a SourcedToolProvider in the same request, the way a real host
+// attaches several distinct providers together.
+type fakePlainProvider struct{ toolName string }
+
+func (p *fakePlainProvider) GetTools(ctx context.Context) ([]mcplib.MCPTool, error) {
+	return []mcplib.MCPTool{{Name: p.toolName}}, nil
+}
+
+func (p *fakePlainProvider) ExecuteTool(ctx context.Context, name string, args map[string]any) (*mcplib.ToolResponse, error) {
+	return nil, mcplib.ErrUnknownTool
+}
+
+var _ mcplib.ToolProvider = (*fakePlainProvider)(nil)
+
+// TestStandardHostToolSource_MultipleProvidersAttachedSeparately is the
+// regression test for the real bug this all exists to catch: a host must
+// attach each request-scoped provider to context individually
+// (mcplib.WithToolProviders(ctx, p1, p2, ...)), never pre-merged via
+// mcplib.NewMultiProvider into one. MultiProvider only forwards
+// GetTools/ExecuteTool — wrapping a SourcedToolProvider inside one makes it
+// invisible to the type assertion in ToolSource/ReadResourceFromSource below,
+// so ToolSource always fails and MCP Apps silently never renders for that
+// provider's tools, exactly as if this file's fix didn't exist. This test
+// attaches a plain provider and a sourced provider side by side (unmerged),
+// which is the only way to keep the sourced one type-assertable.
+func TestStandardHostToolSource_MultipleProvidersAttachedSeparately(t *testing.T) {
+	srv := mcplib.NewServer("test", "0.0.1")
+	h := &StandardHost{MCPServer: func(ctx context.Context) *mcplib.Server { return srv }}
+
+	plain := &fakePlainProvider{toolName: "script_tool"}
+	sourced := &fakeSourcedProvider{
+		source:      "user-server-42",
+		toolName:    "remote1__spin_wheel",
+		resourceURI: testUIResourceURI,
+		resource:    &mcplib.ResourceResponse{Contents: []mcplib.ResourceContent{{URI: testUIResourceURI, Text: "<html></html>"}}},
+	}
+	ctx := mcplib.WithToolProviders(context.Background(), plain, sourced)
+
+	source, ok := h.ToolSource(ctx, "remote1__spin_wheel")
+	if !ok {
+		t.Fatal("expected ToolSource to find the sourced provider among several attached providers")
+	}
+	if source != "user-server-42" {
+		t.Errorf("source = %q, want %q", source, "user-server-42")
+	}
+
+	// The plain provider doesn't implement SourcedToolProvider at all — its
+	// tool must fail closed (no source), not panic or false-positive.
+	if _, ok := h.ToolSource(ctx, "script_tool"); ok {
+		t.Error("expected ToolSource to report no source for a plain provider's tool")
+	}
+}
+
+// TestStandardHostToolSource_ResolvesContextAttachedProvider reproduces a
+// real bug: a Host backed by per-request providers (mcplib.WithToolProviders)
+// rather than servers registered directly on the *mcp.Server — e.g. a
+// per-user set of remote MCP servers — had no way to satisfy
+// SourceScopedHost for those tools at all. srv.ToolSource only ever sees
+// natively-registered tools and servers registered via RegisterRemoteServer*,
+// so /api/resources/read always 403'd for a context-attached provider's
+// tools, and chat.js swallows that as "no app renders" rather than an error.
+func TestStandardHostToolSource_ResolvesContextAttachedProvider(t *testing.T) {
+	srv := mcplib.NewServer("test", "0.0.1")
+	h := &StandardHost{MCPServer: func(ctx context.Context) *mcplib.Server { return srv }}
+
+	provider := &fakeSourcedProvider{
+		source:      "user-server-42",
+		toolName:    "remote1__spin_wheel",
+		resourceURI: testUIResourceURI,
+		resource:    &mcplib.ResourceResponse{Contents: []mcplib.ResourceContent{{URI: testUIResourceURI, Text: "<html></html>"}}},
+	}
+	ctx := mcplib.WithToolProviders(context.Background(), provider)
+
+	source, ok := h.ToolSource(ctx, "remote1__spin_wheel")
+	if !ok {
+		t.Fatal("expected ToolSource to resolve the tool via the context-attached provider")
+	}
+	if source != "user-server-42" {
+		t.Errorf("source = %q, want %q", source, "user-server-42")
+	}
+
+	res, err := h.ReadResourceFromSource(ctx, source, testUIResourceURI)
+	if err != nil {
+		t.Fatalf("ReadResourceFromSource: %v", err)
+	}
+	if res.Text != "<html></html>" {
+		t.Errorf("Text = %q, want the provider's resource content", res.Text)
+	}
+}
+
+// TestStandardHostToolSource_UnknownToolFailsClosed ensures a name no
+// provider or the server recognizes reports ok=false, never a guessed source.
+func TestStandardHostToolSource_UnknownToolFailsClosed(t *testing.T) {
+	srv := mcplib.NewServer("test", "0.0.1")
+	h := &StandardHost{MCPServer: func(ctx context.Context) *mcplib.Server { return srv }}
+
+	provider := &fakeSourcedProvider{source: "user-server-42", toolName: "remote1__spin_wheel"}
+	ctx := mcplib.WithToolProviders(context.Background(), provider)
+
+	if _, ok := h.ToolSource(ctx, "ghost__tool"); ok {
+		t.Error("expected ToolSource to fail closed for an unrecognized tool")
+	}
+}
+
+// TestStandardHostToolSource_NativeTakesPriority ensures a native tool's
+// source ("" per SourceScopedHost's contract) is still reported correctly
+// even when a context-attached SourcedToolProvider is also present.
+func TestStandardHostToolSource_NativeTakesPriority(t *testing.T) {
+	srv := buildTestMCPServer() // registers "ping" natively
+	h := &StandardHost{MCPServer: func(ctx context.Context) *mcplib.Server { return srv }}
+
+	provider := &fakeSourcedProvider{source: "user-server-42", toolName: "remote1__spin_wheel"}
+	ctx := mcplib.WithToolProviders(context.Background(), provider)
+
+	source, ok := h.ToolSource(ctx, "ping")
+	if !ok || source != "" {
+		t.Errorf("ToolSource(\"ping\") = (%q, %v), want (\"\", true)", source, ok)
 	}
 }

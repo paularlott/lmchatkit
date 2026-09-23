@@ -294,6 +294,21 @@ type Host interface {
 	ReadResource(ctx context.Context, uri string) (ResourceResult, error)
 }
 
+// AllToolsHost is an optional interface a Host can implement to list tools
+// that ListTools omits because they're discoverable-only (e.g. an MCP
+// server's search-only tools, reached by the model through a meta-tool like
+// execute_tool rather than listed directly, to save context). An app view's
+// own tool calls (POST /api/tools/call, Source: "app") name such a tool
+// directly — chat.js resolves it to its real, namespaced name itself — so
+// the visibility check in toolVisibilityAllows needs to find it, even though
+// it would never appear in the model-facing list. A Host whose tools are
+// never discoverable-only need not implement this; lmchatkit falls back to
+// ListTools, same as before this existed.
+type AllToolsHost interface {
+	Host
+	ListAllTools(ctx context.Context) ([]Tool, error)
+}
+
 // PersonaSource is the backend behind /api/personas. The default
 // implementation reads TOML files from a watched directory; hosts with a
 // database (or a single system-defined persona) supply their own.
