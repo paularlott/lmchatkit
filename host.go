@@ -395,6 +395,17 @@ func (h *StandardHost) CallTool(ctx context.Context, name string, arguments json
 	}, nil
 }
 
+// namespaceOf returns the federation namespace prefix of a host-side tool
+// name — the part before the first "__" separator — or "" for a native
+// (unnamespaced) tool. It is how handleAppProxy derives the owning
+// namespace of a mounted view from its Via tool name.
+func namespaceOf(name string) string {
+	if idx := strings.Index(name, mcplib.DefaultNamespaceSeparator); idx > 0 {
+		return name[:idx]
+	}
+	return ""
+}
+
 // resolvedToolName returns the tool name a completed CallTool actually
 // invoked. A discoverable (search-only) tool is never called by name
 // directly — the model (or an app view resolving one of its own discovered

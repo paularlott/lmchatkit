@@ -703,6 +703,7 @@ func TestMountRegistersRoutes(t *testing.T) {
 		{http.MethodPost, "/chat/api/prompts/get"},
 		{http.MethodGet, "/chat/api/resources"},
 		{http.MethodPost, "/chat/api/resources/read"},
+		{http.MethodPost, "/chat/api/app-proxy"},
 		{http.MethodGet, "/chat/assets/chat.js"},
 	} {
 		req := httptest.NewRequest(tc.method, tc.path, nil)
@@ -783,3 +784,182 @@ func min(a, b int) int {
 
 // Ensure unused io import stays referenced.
 var _ = io.EOF
+
+// TestHandleAppProxy_ToolsCall covers the app-proxy transport's tool-call
+// relay: a mounted view's bare, host-agnostic tool name is dispatched to the
+// mounting tool's namespace server-side (replacing the prefix computation
+// chat.js used to do client-side via resolveAppToolName), the client echo
+// of ToolResult.Server is only a cross-check, and every cross-server or
+// visibility escape fails closed.
+func TestHandleAppProxy_ToolsCall(t *testing.T) {
+	sources := map[string]string{
+		// Federated tools carry their namespace in the host-side name;
+		// native tools have no namespace and a "" source.
+		"ns1__mount":      "server-a",
+		"ns1__action":     "server-a",
+		"ns1__model_only": "server-a",
+		"ns2__action":     "server-b",
+		"native_mount":    "",
+		"native_action":   "",
+	}
+	dispatched := ""
+	base := &fakeHost{
+		tools: []Tool{
+			{Name: "ns1__mount", Visibility: []string{"app"}},
+			{Name: "ns1__action", Visibility: []string{"app"}},
+			{Name: "ns1__model_only", Visibility: []string{"model"}},
+			{Name: "ns2__action", Visibility: []string{"app"}},
+			{Name: "native_mount", Visibility: []string{"app"}},
+			{Name: "native_action", Visibility: []string{"app"}},
+		},
+		callTool: func(ctx context.Context, name string, args json.RawMessage) (ToolResult, error) {
+			dispatched = name
+			return ToolResult{Content: "ok:" + name}, nil
+		},
+	}
+	host := &fakeScopedHost{
+		fakeHost: base,
+		toolSource: func(ctx context.Context, name string) (string, bool) {
+			src, ok := sources[name]
+			return src, ok
+		},
+	}
+	s := newTestServer(t, host)
+
+	call := func(t *testing.T, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		dispatched = ""
+		req := httptest.NewRequest(http.MethodPost, "/chat/api/app-proxy", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		s.handleAppProxy(rec, req)
+		return rec
+	}
+
+	t.Run("a bare name is dispatched to the mounting tool's namespace", func(t *testing.T) {
+		rec := call(t, `{"method":"tools/call","params":{"name":"action","arguments":{}},"via":"ns1__mount"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		if dispatched != "ns1__action" {
+			t.Errorf("dispatched = %q, want %q (own server, not the same-named tool on server-b)", dispatched, "ns1__action")
+		}
+	})
+
+	t.Run("an already-namespaced name is dispatched verbatim", func(t *testing.T) {
+		rec := call(t, `{"method":"tools/call","params":{"name":"ns1__action","arguments":{}},"via":"ns1__mount"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		if dispatched != "ns1__action" {
+			t.Errorf("dispatched = %q, want %q", dispatched, "ns1__action")
+		}
+	})
+
+	t.Run("a cross-server tool is not reachable even by its full name", func(t *testing.T) {
+		rec := call(t, `{"method":"tools/call","params":{"name":"ns2__action","arguments":{}},"via":"ns1__mount"}`)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403 (source mismatch): %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("a model-only tool stays unreachable from a view", func(t *testing.T) {
+		rec := call(t, `{"method":"tools/call","params":{"name":"model_only","arguments":{}},"via":"ns1__mount"}`)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403 (visibility): %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("an unknown tool name fails closed", func(t *testing.T) {
+		rec := call(t, `{"method":"tools/call","params":{"name":"nope","arguments":{}},"via":"ns1__mount"}`)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("a native mount dispatches bare names unchanged", func(t *testing.T) {
+		rec := call(t, `{"method":"tools/call","params":{"name":"native_action","arguments":{}},"via":"native_mount"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		if dispatched != "native_action" {
+			t.Errorf("dispatched = %q, want %q", dispatched, "native_action")
+		}
+	})
+
+	t.Run("a native mount cannot reach a federated tool", func(t *testing.T) {
+		rec := call(t, `{"method":"tools/call","params":{"name":"ns1__action","arguments":{}},"via":"native_mount"}`)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403 (source mismatch): %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("via is required", func(t *testing.T) {
+		rec := call(t, `{"method":"tools/call","params":{"name":"action","arguments":{}}}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("only tools/call and resources/read are relayed", func(t *testing.T) {
+		rec := call(t, `{"method":"prompts/get","params":{"name":"p"},"via":"ns1__mount"}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// TestHandleAppProxy_ResourcesRead is the resource-side twin of the
+// tool-call test: reads relayed over the app-proxy stay scoped to the
+// mounting tool's own MCP server, exactly like the Via branch of
+// handleReadResource.
+func TestHandleAppProxy_ResourcesRead(t *testing.T) {
+	readFrom, readURI := "", ""
+	host := &fakeScopedHost{
+		fakeHost: &fakeHost{
+			tools: []Tool{{Name: "ns1__mount", Visibility: []string{"app"}}},
+		},
+		toolSource: func(ctx context.Context, name string) (string, bool) {
+			if name == "ns1__mount" {
+				return "server-a", true
+			}
+			return "", false
+		},
+		readResourceFromSource: func(ctx context.Context, source, uri string) (ResourceResult, error) {
+			readFrom, readURI = source, uri
+			return ResourceResult{URI: uri, Text: "<html></html>", MimeType: "text/html;profile=mcp-app"}, nil
+		},
+	}
+	s := newTestServer(t, host)
+
+	call := func(t *testing.T, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/chat/api/app-proxy", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		s.handleAppProxy(rec, req)
+		return rec
+	}
+
+	t.Run("a read is scoped to the mounting tool's server", func(t *testing.T) {
+		rec := call(t, `{"method":"resources/read","params":{"uri":"ui://x/y.html"},"via":"ns1__mount"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		if readFrom != "server-a" || readURI != "ui://x/y.html" {
+			t.Errorf("read from %q uri %q, want server-a / ui://x/y.html", readFrom, readURI)
+		}
+	})
+
+	t.Run("an unresolvable via denies rather than allows", func(t *testing.T) {
+		rec := call(t, `{"method":"resources/read","params":{"uri":"ui://x/y.html"},"via":"ns2__mount"}`)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("a missing uri is a bad request", func(t *testing.T) {
+		rec := call(t, `{"method":"resources/read","params":{},"via":"ns1__mount"}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+		}
+	})
+}

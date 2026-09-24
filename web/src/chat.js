@@ -2465,10 +2465,17 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     async hydrateAppResource(call) {
       if (!call.ui || !call.ui.resourceUri || call.appResource) return;
       try {
-        const resourceResp = await fetch(`${this.prefix}/api/resources/read`, {
+        // Same app-proxy transport the mounted view itself uses (see
+        // mountAppView): via scopes the read to the mounting tool's own MCP
+        // server, namespace derived server-side.
+        const resourceResp = await fetch(`${this.prefix}/api/app-proxy`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ uri: call.ui.resourceUri, via: hostToolNameFor(call) }),
+          body: JSON.stringify({
+            method: "resources/read",
+            params: { uri: call.ui.resourceUri },
+            via: hostToolNameFor(call),
+          }),
         });
         // A non-OK response (e.g. a 500 from a server error, or a 403 from
         // toolSourceAllows) still has a valid JSON body — {"error": "..."}
@@ -2597,8 +2604,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     // call.ui/call.appResource by executeToolCall or the reload rehydration
     // pass) into a sandboxed iframe and bridges the MCP Apps postMessage
     // protocol (https://github.com/modelcontextprotocol/ext-apps) between
-    // the view and this server's own /api/tools/call and /api/resources/read
-    // routes.
+    // the view and this server's /api/app-proxy route.
     //
     // Called via the template's x-effect on the container element — the
     // element only exists once call.appResource resolves (the template's
@@ -2740,49 +2746,42 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
 
         // Everything else (tools/call, resources/read, ...) is proxied to
         // this server's own MCP-backed routes per the extension's "Sandbox
-        // proxy" behavior.
+        // proxy" behavior — over the single app-proxy transport, a
+        // {method, params, via} POST. The view only knows its own bare,
+        // host-agnostic names: the backend re-attaches the mounting tool's
+        // namespace and enforces MCP Apps visibility (_meta.ui.visibility)
+        // plus same-server ownership, so nothing about routing is decided
+        // on this side of the bridge beyond naming the view's mount.
         if (msg.id === undefined) return;
+        const appProxy = async (method, params) => {
+          const resp = await fetch(`${this.prefix}/api/app-proxy`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            // Via names this view's mount; the backend derives the owning
+            // namespace from it, re-attaches the prefix server-side, and
+            // enforces visibility + same-server ownership.
+            body: JSON.stringify({ method, params, via: hostToolNameFor(call) }),
+          });
+          if (!resp.ok) {
+            const errData = await resp.json().catch(() => ({}));
+            throw new Error(errData.error || `${method} failed (${resp.status})`);
+          }
+          return resp.json();
+        };
         try {
           let result;
           if (msg.method === "tools/call") {
-            const resp = await fetch(`${this.prefix}/api/tools/call`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                name: resolveAppToolName(hostToolNameFor(call), msg.params.name),
-                arguments: msg.params.arguments || {},
-                // Marks this as a call the view made of itself, not a
-                // model-approved one — the server enforces MCP Apps
-                // visibility (_meta.ui.visibility) based on this: a view may
-                // only reach a tool whose visibility includes "app".
-                source: "app",
-                // Names the tool that mounted this view, so the server can
-                // also enforce the requested tool belongs to the same MCP
-                // server (see toolSourceAllows in lmchatkit) — visibility
-                // alone can't stop a view from reaching a same-named tool
-                // on a completely different, unnamespaced federated server.
-                via: hostToolNameFor(call),
-              }),
+            const toolData = await appProxy("tools/call", {
+              name: msg.params.name,
+              arguments: msg.params.arguments || {},
             });
-            const toolData = await resp.json();
-            if (!resp.ok) throw new Error(toolData.error || `tools/call failed (${resp.status})`);
             result = {
               content: [{ type: "text", text: toolData.content }],
               structuredContent: toolData.structured_content,
               isError: !!toolData.is_error,
             };
           } else if (msg.method === "resources/read") {
-            const resp = await fetch(`${this.prefix}/api/resources/read`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              // via scopes the read to the mounting tool's own MCP server
-              // (see toolSourceAllows/handleReadResource in lmchatkit) —
-              // otherwise the view could read any resource from any
-              // connected server just by knowing its URI.
-              body: JSON.stringify({ uri: msg.params.uri, via: hostToolNameFor(call) }),
-            });
-            const resData = await resp.json();
-            if (!resp.ok) throw new Error(resData.error || `resources/read failed (${resp.status})`);
+            const resData = await appProxy("resources/read", { uri: msg.params.uri });
             result = { contents: [{ uri: resData.uri, text: resData.text, blob: resData.blob, mimeType: resData.mime_type }] };
           } else if (msg.method === "ui/open-link") {
             // Spec: host SHOULD open the URL in the user's browser. Scheme is
@@ -3212,35 +3211,17 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
 //   - JSON string → parse it
 //   - anything else → wrap under _raw so the UI has *something* to render
 //     (better than the old `String(obj)` which produced "[object Object]").
-// resolveAppToolName maps a bare tool name an MCP App's own script asks for
-// (it's written host-agnostic, so it only knows its own un-namespaced name,
-// e.g. "spin_wheel") back to the name this host actually knows it by
-// (e.g. "dashboard__spin_wheel", when the tool was federated from a remote
-// server under the "dashboard" namespace). Without this, an app calling
-// itself — or a sibling tool in the same namespace, like a "claim" button
-// calling a separate "claim_prize" tool — gets "unknown tool" from the host
-// because the namespace prefix federation adds is invisible to the app.
-// hostToolName is the namespaced name the CURRENT tool call is known by —
-// see hostToolNameFor, which resolves this from call (not always call.name
-// itself); if it carries no "__" separator, the tool wasn't namespaced
-// (native or unnamespaced-remote), so the requested name is used verbatim.
-function resolveAppToolName(hostToolName, requestedName) {
-  const sep = "__";
-  const idx = hostToolName.indexOf(sep);
-  if (idx < 0) return requestedName;
-  const prefix = hostToolName.slice(0, idx + sep.length);
-  return requestedName.startsWith(prefix) ? requestedName : prefix + requestedName;
-}
-
 // hostToolNameFor returns the real, namespaced tool name that mounted this
 // view. Usually that's just call.name — but a discoverable (search-only)
 // tool is never called by its own name; the model calls the built-in
 // execute_tool meta-tool instead, wrapping the real (already-resolved,
 // already-namespaced) name as call.arguments.name (see mcp.Server's
 // handleExecuteTool and StandardHost.resolvedToolName on the Go side).
-// call.name is then literally "execute_tool", which has no "__" for
-// resolveAppToolName to extract a namespace from — so for that case, use
-// the real name from call.arguments.name instead.
+// call.name is then literally "execute_tool", which carries no "__"
+// namespace for the backend to derive the view's owning server from — so
+// for that case, use the real name from call.arguments.name instead. This
+// is the Via of every app-proxy call; the namespace re-attachment for the
+// view's own bare tool names now happens server-side (handleAppProxy).
 function hostToolNameFor(call) {
   if (call.name === "execute_tool" && call.arguments && typeof call.arguments.name === "string") {
     return call.arguments.name;

@@ -172,6 +172,7 @@ func (s *Server) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST "+prefix+"/api/prompts/get", wrapf(s.handleGetPrompt))
 	mux.HandleFunc("GET "+prefix+"/api/resources", wrapf(s.handleListResources))
 	mux.HandleFunc("POST "+prefix+"/api/resources/read", wrapf(s.handleReadResource))
+	mux.HandleFunc("POST "+prefix+"/api/app-proxy", wrapf(s.handleAppProxy))
 	mux.HandleFunc("GET "+prefix+"/api/config", wrapf(s.handleConfig))
 
 	// File upload — only mounted when enabled in Config.

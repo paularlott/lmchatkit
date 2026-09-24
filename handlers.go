@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
+
+	mcplib "github.com/paularlott/mcp"
 )
 
 // handlePersonas returns the persona snapshot. Always an array — a built-in
@@ -286,6 +289,127 @@ func (s *Server) handleReadResource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+// appProxyRequest is the body shape for POST /api/app-proxy — the single
+// relay for a mounted MCP Apps view's JSON-RPC (see mountAppView in
+// chat.js):
+//
+//	{method, params, via}
+//
+// Method/Params are the view's JSON-RPC verbatim (params is opaque beyond
+// the per-method decode) and Via names the host-side tool that mounted the
+// view. Routing is derived from Via alone — the in-page bridge always
+// knows the view's mount, so there is nothing else to trust or check.
+type appProxyRequest struct {
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
+	Via    string          `json:"via,omitempty"`
+}
+
+// appProxyToolParams / appProxyResourceParams decode the params of the two
+// methods the app-proxy relays. Anything else a view asks for is rejected —
+// the transport is deliberately narrow: a sandboxed view gets tools and
+// resources on its own server, nothing else.
+type appProxyToolParams struct {
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+type appProxyResourceParams struct {
+	URI string `json:"uri"`
+}
+
+// handleAppProxy relays a mounted MCP Apps view's tools/call and
+// resources/read. It is the server-side replacement for the prefix
+// computation chat.js used to do client-side (resolveAppToolName, retired):
+// the view speaks its own bare, host-agnostic names, and the namespace is
+// re-attached here from Via before dispatch. The same two guards the old
+// /api/tools/call app path applied still apply, now on the reconstructed
+// name: _meta.ui.visibility must include "app" (toolVisibilityAllows) and
+// the target must belong to the same MCP server as the mounting tool
+// (toolSourceAllows — which is also what stops a bare name being used to
+// reach a native tool, or a mis-declared namespace being used to reach
+// another server's tool: both fail the source comparison).
+func (s *Server) handleAppProxy(w http.ResponseWriter, r *http.Request) {
+	var req appProxyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Via == "" {
+		writeError(w, http.StatusBadRequest, "via is required")
+		return
+	}
+	if req.Method == "" {
+		writeError(w, http.StatusBadRequest, "method is required")
+		return
+	}
+	namespace := namespaceOf(req.Via)
+
+	switch req.Method {
+	case "tools/call":
+		var params appProxyToolParams
+		if err := json.Unmarshal(req.Params, &params); err != nil || params.Name == "" {
+			writeError(w, http.StatusBadRequest, "tools/call params require a name")
+			return
+		}
+		name := params.Name
+		// Re-attach the mounting tool's namespace unless the name already
+		// carries it (a view that somehow learned its host-side name still
+		// resolves; one that didn't gets its bare name dispatched home).
+		if namespace != "" && !strings.HasPrefix(name, namespace+mcplib.DefaultNamespaceSeparator) {
+			name = namespace + mcplib.DefaultNamespaceSeparator + name
+		}
+		if !s.toolVisibilityAllows(r.Context(), name, "app") {
+			writeError(w, http.StatusForbidden, fmt.Sprintf("tool %q is not callable from this context", name))
+			return
+		}
+		if !s.toolSourceAllows(r.Context(), req.Via, name) {
+			writeError(w, http.StatusForbidden, fmt.Sprintf("tool %q does not belong to the calling view's server", name))
+			return
+		}
+		res, err := s.host.CallTool(r.Context(), name, params.Arguments)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+
+	case "resources/read":
+		var params appProxyResourceParams
+		if err := json.Unmarshal(req.Params, &params); err != nil || params.URI == "" {
+			writeError(w, http.StatusBadRequest, "resources/read params require a uri")
+			return
+		}
+		// Routed by the mounting tool's own server, exactly like the Via
+		// branch of handleReadResource this mirrors — the Server field
+		// carries no routing authority for reads either.
+		scoped, ok := s.host.(SourceScopedHost)
+		if !ok {
+			res, err := s.host.ReadResource(r.Context(), params.URI)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, res)
+			return
+		}
+		source, ok := scoped.ToolSource(r.Context(), req.Via)
+		if !ok {
+			writeError(w, http.StatusForbidden, fmt.Sprintf("tool %q is not recognized", req.Via))
+			return
+		}
+		res, err := scoped.ReadResourceFromSource(r.Context(), source, params.URI)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+
+	default:
+		writeError(w, http.StatusBadRequest, "unsupported method: "+req.Method)
+	}
 }
 
 // handleAsset serves a file from the embedded JS/CSS bundle. The bundle is
