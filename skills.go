@@ -17,16 +17,16 @@ const SkillToolName = "lmchatkit__get_skill"
 // system prompt, then calls this tool to retrieve the full content.
 var SkillTool = Tool{
 	Name:        SkillToolName,
-	Description: "Retrieve a skill's detailed instructions by URI. Pass the skill URI (e.g. 'skill://golang' or '@skill://golang'). Returns the skill content as text.",
+	Description: "Retrieve a skill's detailed instructions by URI. Pass the skill URI (e.g. 'skill://golang/SKILL.md'). Returns the skill content as text.",
 	InputSchema: map[string]interface{}{
 		"type": "object",
 		"properties": map[string]interface{}{
-			"name": map[string]interface{}{
+			"uri": map[string]interface{}{
 				"type":        "string",
-				"description": "The skill URI to retrieve (e.g. skill://golang)",
+				"description": "The skill URI to retrieve (e.g. skill://golang/SKILL.md)",
 			},
 		},
-		"required": []string{"name"},
+		"required": []string{"uri"},
 	},
 }
 
@@ -50,21 +50,22 @@ func (s *Server) hasSkillResources(ctx context.Context) bool {
 // and routes it to Host.ReadResource. Returns (result, true) if handled,
 // (_, false) if the tool name doesn't match.
 //
-// Leading @ is stripped from the URI (the model may include it since
-// the system prompt uses @ for resource references).
+// The tool takes exactly one argument, uri, as declared on every request;
+// anything else is an error the model corrects on its next call. A leading
+// @ is stripped (the chat uses @ for resource references).
 func (s *Server) trySkillToolCall(ctx context.Context, name string, arguments json.RawMessage) (ToolResult, bool) {
 	if name != SkillToolName {
 		return ToolResult{}, false
 	}
 
 	var args struct {
-		Name string `json:"name"`
+		URI string `json:"uri"`
 	}
 	_ = json.Unmarshal(arguments, &args)
 
-	uri := strings.TrimPrefix(strings.TrimSpace(args.Name), "@")
+	uri := strings.TrimPrefix(strings.TrimSpace(args.URI), "@")
 	if uri == "" {
-		return ToolResult{Content: "Error: skill name is required", IsError: true}, true
+		return ToolResult{Content: "Error: skill URI is required", IsError: true}, true
 	}
 
 	result, err := s.host.ReadResource(ctx, uri)

@@ -239,7 +239,7 @@ func TestHandleCallTool_EnforcesVisibility(t *testing.T) {
 		// sandboxed view must not be able to read host skill:// content,
 		// which would cross the very server boundary SourceScopedHost
 		// enforces for real tools.
-		rec := call(t, `{"name":"lmchatkit__get_skill","arguments":{"name":"skill://anything"},"source":"app","via":"sales_report"}`)
+		rec := call(t, `{"name":"lmchatkit__get_skill","arguments":{"uri":"skill://anything"},"source":"app","via":"sales_report"}`)
 		if rec.Code != http.StatusForbidden {
 			t.Fatalf("status = %d, want 403: %s", rec.Code, rec.Body.String())
 		}

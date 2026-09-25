@@ -1530,6 +1530,11 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       this.showDeleteChatModal = false;
       this.deleteChatTarget = null;
       if (this._serverMode) {
+        // Update the sidebar immediately rather than waiting for the
+        // conversation_deleted SSE to loop back through the server — the
+        // event also refreshes other tabs, but the deleting tab should not
+        // depend on that round trip (and can race it).
+        this.conversations = this.conversations.filter((c) => c.id !== id);
         fetch(`${this.prefix}/api/conversations/${id}`, { method: "DELETE" }).catch(() => {});
       } else {
         this.conversations = this.conversations.filter((c) => c.id !== id);
