@@ -285,6 +285,15 @@ if (window.Alpine && typeof window.Alpine.data === "function") {
 // they can't drift apart the way a duplicated literal would (a view that
 // resizes itself past what was advertised as the ceiling would otherwise
 // silently grow taller than the chat layout was ever meant to allow).
+// Model params whose values are strings; every other param field is a
+// number, entered as text in the form.
+const STRING_PARAMS = new Set(["reasoning_effort"]);
+
+function paramValue(key, value) {
+  if (typeof value === "string" && !STRING_PARAMS.has(key)) return parseFloat(value);
+  return value;
+}
+
 const APP_MAX_HEIGHT = 700;
 
 // APP_MIME_TYPE is the one content type the MCP Apps extension defines for
@@ -423,6 +432,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       repeat_penalty: null,
       context_length: null,
       max_tokens: null,
+      reasoning_effort: "",
     },
     // Model parameters — populated from the selected persona's [params],
     // user can override any field. null = use API default. Stored on the
@@ -434,6 +444,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       repeat_penalty: null,
       context_length: null,
       max_tokens: null,
+      reasoning_effort: "",
     },
 
     // "Always allow" set — session-global, shared across all chats in this
@@ -1197,6 +1208,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         repeat_penalty: pp.repeat_penalty != null ? pp.repeat_penalty : null,
         context_length: pp.context_length != null ? pp.context_length : null,
         max_tokens: pp.max_tokens != null ? pp.max_tokens : null,
+        reasoning_effort: pp.reasoning_effort || "",
       };
     },
 
@@ -1253,6 +1265,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         repeat_penalty: cp.repeat_penalty != null ? cp.repeat_penalty : null,
         context_length: cp.context_length != null ? cp.context_length : null,
         max_tokens: cp.max_tokens != null ? cp.max_tokens : null,
+        reasoning_effort: cp.reasoning_effort || "",
       };
       this.showEditModal = true;
     },
@@ -1296,6 +1309,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
         repeat_penalty: pp.repeat_penalty != null ? pp.repeat_penalty : null,
         context_length: pp.context_length != null ? pp.context_length : null,
         max_tokens: pp.max_tokens != null ? pp.max_tokens : null,
+        reasoning_effort: pp.reasoning_effort || "",
       };
     },
 
@@ -1330,7 +1344,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       if (!this.editParams) return out;
       for (const [k, v] of Object.entries(this.editParams)) {
         if (v !== null && v !== "" && v !== undefined && !Number.isNaN(v)) {
-          out[k] = typeof v === "string" ? parseFloat(v) : v;
+          out[k] = paramValue(k, v);
         }
       }
       return out;
@@ -1381,7 +1395,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       if (this.setupParams) {
         for (const [k, v] of Object.entries(this.setupParams)) {
           if (v !== null && v !== "" && v !== undefined) {
-            params[k] = typeof v === "string" ? parseFloat(v) : v;
+            params[k] = paramValue(k, v);
           }
         }
       }

@@ -65,7 +65,12 @@ func OpenAIChatRequest(req CompleteRequest) map[string]interface{} {
 		body["tools"] = tools
 	}
 
+	// Unset params (null or "", e.g. a persona's reasoning_effort left at
+	// default) are left out, so the provider applies its own default.
 	for k, v := range req.Params {
+		if v == nil || v == "" {
+			continue
+		}
 		body[k] = v
 	}
 
@@ -237,8 +242,14 @@ type StandardHost struct {
 
 	// OpenAIBaseURL is where /v1/chat/completions lives. For a self-loopback
 	// (llmrouter), this is "http://127.0.0.1:<port>". For an external LLM
-	// proxy, it's that proxy's URL. Required.
+	// proxy, it's that proxy's URL. Required unless ChatCompletionsURL is set.
 	OpenAIBaseURL string
+
+	// ChatCompletionsURL, when set, is the full chat completions URL to post
+	// to instead of OpenAIBaseURL + "/v1/chat/completions" — for
+	// OpenAI-compatible endpoints at another path (e.g. Gemini's
+	// .../v1beta/openai/chat/completions).
+	ChatCompletionsURL string
 
 	// OpenAIToken is the bearer token sent with the completion request.
 	// For a self-loopback this is the server's API token; for a user-scoped
@@ -291,7 +302,11 @@ func (h *StandardHost) Complete(ctx context.Context, req CompleteRequest, events
 		return err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, h.OpenAIBaseURL+"/v1/chat/completions", bytes.NewReader(raw))
+	url := h.ChatCompletionsURL
+	if url == "" {
+		url = h.OpenAIBaseURL + "/v1/chat/completions"
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}

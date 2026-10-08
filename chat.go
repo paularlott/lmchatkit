@@ -65,11 +65,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// an in-memory cache with file watching — the lookup is a map read
 	// and the prompt is always current with the persona file.
 	var systemPrompt string
+	var personaParams map[string]interface{}
 	if req.PersonaID != "" && s.personas != nil {
 		personas, _ := s.personas.Personas(r.Context())
 		for _, p := range personas {
 			if p.ID == req.PersonaID {
 				systemPrompt = p.SystemPrompt
+				personaParams = p.Params
 				break
 			}
 		}
@@ -145,7 +147,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			Model:    req.Model,
 			Messages: req.Messages,
 			Tools:    tools,
-			Params:   req.Params,
+			Params:   mergeParams(personaParams, req.Params),
 		}, events)
 		done <- err
 		close(events)
@@ -385,4 +387,22 @@ func parsePromptArgs(argStr string, prompt *Prompt) map[string]string {
 
 func splitArgs(s string) []string {
 	return strings.Fields(s)
+}
+
+// mergeParams returns the persona's model params overridden by the request's.
+// The browser only round-trips the params it has fields for (temperature,
+// top_p, max_tokens, ...), so others in the persona, such as
+// reasoning_effort, would otherwise never reach the model.
+func mergeParams(persona, request map[string]interface{}) map[string]interface{} {
+	if len(persona) == 0 {
+		return request
+	}
+	merged := make(map[string]interface{}, len(persona)+len(request))
+	for k, v := range persona {
+		merged[k] = v
+	}
+	for k, v := range request {
+		merged[k] = v
+	}
+	return merged
 }

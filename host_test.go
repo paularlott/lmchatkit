@@ -483,3 +483,57 @@ func TestStandardHostToolSource_NativeTakesPriority(t *testing.T) {
 		t.Errorf("ToolSource(\"ping\") = (%q, %v), want (\"\", true)", source, ok)
 	}
 }
+
+// Complete posts to ChatCompletionsURL when set, else OpenAIBaseURL +
+// /v1/chat/completions, forwarding the request params.
+func TestStandardHostComplete_URLAndParams(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	for name, tc := range map[string]struct {
+		host     StandardHost
+		wantPath string
+	}{
+		"base url":      {StandardHost{OpenAIBaseURL: srv.URL}, "/v1/chat/completions"},
+		"override wins": {StandardHost{OpenAIBaseURL: "http://unused.invalid", ChatCompletionsURL: srv.URL + "/v1beta/openai/chat/completions"}, "/v1beta/openai/chat/completions"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			events := make(chan Event, 16)
+			req := CompleteRequest{Model: "m", Messages: []Message{{Role: RoleUser, Content: "hi"}}, Params: map[string]interface{}{"reasoning_effort": "low"}}
+			if err := tc.host.Complete(context.Background(), req, events); err != nil {
+				t.Fatal(err)
+			}
+			if gotPath != tc.wantPath {
+				t.Errorf("path = %q, want %q", gotPath, tc.wantPath)
+			}
+			if gotBody["reasoning_effort"] != "low" {
+				t.Errorf("reasoning_effort not forwarded: %v", gotBody)
+			}
+		})
+	}
+}
+
+// Unset params aren't sent: the provider applies its own default.
+func TestOpenAIChatRequest_SkipsUnsetParams(t *testing.T) {
+	body := OpenAIChatRequest(CompleteRequest{Model: "m", Params: map[string]interface{}{
+		"reasoning_effort": "", "temperature": nil, "max_tokens": 100, "top_p": 0.0,
+	}})
+	for _, k := range []string{"reasoning_effort", "temperature"} {
+		if _, sent := body[k]; sent {
+			t.Errorf("%s sent: %v", k, body[k])
+		}
+	}
+	if body["max_tokens"] != 100 || body["top_p"] != 0.0 {
+		t.Errorf("set params dropped: %v", body)
+	}
+	if _, sent := OpenAIChatRequest(CompleteRequest{Model: "m"})["reasoning_effort"]; sent {
+		t.Error("reasoning_effort sent when never set")
+	}
+}

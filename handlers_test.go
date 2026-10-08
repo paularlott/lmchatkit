@@ -963,3 +963,38 @@ func TestHandleAppProxy_ResourcesRead(t *testing.T) {
 		}
 	})
 }
+
+// Persona params reach the model even when the browser doesn't send them
+// (it only round-trips the params it has fields for); request params win.
+func TestHandleChatMergesPersonaParams(t *testing.T) {
+	var got CompleteRequest
+	host := &fakeHost{
+		complete: func(ctx context.Context, req CompleteRequest, events chan<- Event) error {
+			got = req
+			events <- Event{Type: EventDone, FinishReason: FinishStop}
+			return nil
+		},
+	}
+	s, err := New(Config{Prefix: "/chat", Host: host, PersonaSource: StaticPersonas{
+		{ID: "p", Name: "P", Params: map[string]interface{}{"reasoning_effort": "low", "temperature": 0.2}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"model":"m","persona_id":"p","messages":[{"role":"user","content":"hi"}],"params":{"temperature":0.9}}`
+	rec := httptest.NewRecorder()
+	s.handleChat(rec, httptest.NewRequest(http.MethodPost, "/chat/api/chat", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: %d (%s)", rec.Code, rec.Body.String())
+	}
+	if got.Params["reasoning_effort"] != "low" {
+		t.Errorf("reasoning_effort = %v, want the persona's low", got.Params["reasoning_effort"])
+	}
+	if got.Params["temperature"] != 0.9 {
+		t.Errorf("temperature = %v, want the request's 0.9", got.Params["temperature"])
+	}
+	if body := OpenAIChatRequest(got); body["reasoning_effort"] != "low" {
+		t.Errorf("upstream body reasoning_effort = %v", body["reasoning_effort"])
+	}
+}

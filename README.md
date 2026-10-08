@@ -250,9 +250,10 @@ top_p          = 0.95    # nucleus sampling threshold
 top_k          = 40      # top-k sampling (llama.cpp / Ollama)
 repeat_penalty  = 1.1     # penalise repeated tokens (llama.cpp / Ollama)
 context_length  = 8192    # max context window in tokens
+reasoning_effort = "low"  # reasoning models: low, medium or high
 ```
 
-All fields are optional except `name` (which falls back to the filename stem if omitted). `default_model` is also optional — when omitted, the user picks a model from the picker. `[params]` is a free-form map merged into every completion request — standard OpenAI params (`temperature`, `top_p`, `max_tokens`, `frequency_penalty`, `presence_penalty`) and llama.cpp/Ollama params (`top_k`, `repeat_penalty`, `context_length`) are all forwarded to the host, which passes them through to the underlying API.
+All fields are optional except `name` (which falls back to the filename stem if omitted). `default_model` is also optional — when omitted, the user picks a model from the picker. `[params]` is a free-form map merged into every completion request — standard OpenAI params (`temperature`, `top_p`, `max_tokens`, `frequency_penalty`, `presence_penalty`, `reasoning_effort`) and llama.cpp/Ollama params (`top_k`, `repeat_penalty`, `context_length`) are all forwarded to the host, which passes them through to the underlying API. The server merges the persona's params into every request, so ones the chat UI has no field for still reach the model; values set in the UI win.
 
 The directory is watched with `fsnotify`; adding or editing a persona takes effect on the next request without restarting the server.
 
