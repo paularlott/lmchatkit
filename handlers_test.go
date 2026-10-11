@@ -998,3 +998,52 @@ func TestHandleChatMergesPersonaParams(t *testing.T) {
 		t.Errorf("upstream body reasoning_effort = %v", body["reasoning_effort"])
 	}
 }
+
+// TestHandleCallTool_ModelReachesDiscoverableToolViaExecuteTool reproduces a
+// real bug: the model calls a discoverable tool through execute_tool (and
+// finds it with tool_search), but neither meta-tool is in AllToolsHost's
+// full list, so every such call was refused as "not callable from this
+// context". The wrapped tool's visibility must govern instead.
+func TestHandleCallTool_ModelReachesDiscoverableToolViaExecuteTool(t *testing.T) {
+	host := &fakeAllToolsHost{
+		fakeHost: &fakeHost{
+			tools: []Tool{{Name: "tool_search"}, {Name: "execute_tool"}},
+			callTool: func(ctx context.Context, name string, args json.RawMessage) (ToolResult, error) {
+				return ToolResult{Content: "ok:" + name}, nil
+			},
+		},
+		allTools: []Tool{
+			{Name: "list_spaces"},
+			{Name: "add_sale", Visibility: []string{"app"}},
+		},
+	}
+	s := newTestServer(t, host)
+	call := func(t *testing.T, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/chat/api/tools/call", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		s.handleCallTool(rec, req)
+		return rec
+	}
+
+	for _, tc := range []struct {
+		name, body string
+		want       int
+	}{
+		{"execute_tool with parameters", `{"name":"execute_tool","arguments":{"name":"list_spaces","parameters":{}}}`, http.StatusOK},
+		{"execute_tool with legacy arguments key", `{"name":"execute_tool","arguments":{"name":"list_spaces","arguments":{}}}`, http.StatusOK},
+		{"tool_search", `{"name":"tool_search","arguments":{"query":"spaces"}}`, http.StatusOK},
+		{"execute_tool cannot reach an app-only tool", `{"name":"execute_tool","arguments":{"name":"add_sale","parameters":{}}}`, http.StatusForbidden},
+		{"execute_tool of an unknown tool", `{"name":"execute_tool","arguments":{"name":"nope","parameters":{}}}`, http.StatusForbidden},
+		{"execute_tool with no name", `{"name":"execute_tool","arguments":{}}`, http.StatusForbidden},
+		{"execute_tool wrapping itself", `{"name":"execute_tool","arguments":{"name":"execute_tool","parameters":{"name":"add_sale"}}}`, http.StatusForbidden},
+		{"an app view cannot use execute_tool", `{"name":"execute_tool","arguments":{"name":"list_spaces"},"source":"app","via":"list_spaces"}`, http.StatusForbidden},
+		{"an app view cannot use tool_search", `{"name":"tool_search","arguments":{},"source":"app","via":"list_spaces"}`, http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if rec := call(t, tc.body); rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+}

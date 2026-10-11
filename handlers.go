@@ -121,7 +121,7 @@ func (s *Server) handleCallTool(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if !s.toolVisibilityAllows(r.Context(), req.Name, role) {
+	if !s.toolVisibilityAllows(r.Context(), visibilityTarget(req.Name, req.Arguments, role), role) {
 		writeError(w, http.StatusForbidden, fmt.Sprintf("tool %q is not callable from this context", req.Name))
 		return
 	}
@@ -148,7 +148,35 @@ func (s *Server) handleCallTool(w http.ResponseWriter, r *http.Request) {
 // real name, defeating the very calls this is meant to allow. Fails closed:
 // a list error or a name it doesn't recognize both deny, rather than letting
 // an unresolvable call fall through as allowed.
+// visibilityTarget returns the tool whose visibility governs a call to name.
+// The model reaches a discoverable (search-only) tool through the
+// tool_search and execute_tool meta-tools, which AllToolsHost's full list
+// leaves out by design, so a lookup on the meta-tool's own name always
+// failed and denied every call. execute_tool is judged by the tool it wraps;
+// with no wrapped name it stays execute_tool and fails closed. tool_search
+// only lists tools, and is judged as itself unless the caller is the model.
+func visibilityTarget(name string, arguments json.RawMessage, role string) string {
+	if role != "model" {
+		return name
+	}
+	switch name {
+	case mcplib.ToolSearchName:
+		return ""
+	case mcplib.ExecuteToolName:
+		var args struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(arguments, &args) == nil && args.Name != "" && args.Name != mcplib.ExecuteToolName {
+			return args.Name
+		}
+	}
+	return name
+}
+
 func (s *Server) toolVisibilityAllows(ctx context.Context, name, role string) bool {
+	if name == "" {
+		return true
+	}
 	var (
 		tools []Tool
 		err   error
