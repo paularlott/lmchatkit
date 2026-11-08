@@ -429,6 +429,10 @@ go test ./...
 
 Coverage focuses on the protocol handlers (chat streaming, tool filtering, tool execution, prompt rendering, resource reading), the persona and command loaders (TOML parsing, hot reload, edge cases), and the SSE translator. The frontend is not unit-tested; verify changes manually.
 
+## Contributing
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to contribute and how to sign the Contributor License Agreement.
+
 ## License
 
 See [LICENSE.txt](LICENSE.txt).
