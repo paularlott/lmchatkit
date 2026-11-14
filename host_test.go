@@ -542,37 +542,63 @@ func TestOpenAIChatRequest_SkipsUnsetParams(t *testing.T) {
 	}
 }
 
-// TestStandardHostListTools_Destructive pins how a tool's annotations map
-// to Tool.Destructive: only an explicit destructiveHint: true counts — an
-// absent hint (most tools) or an explicit false does not.
-func TestStandardHostListTools_Destructive(t *testing.T) {
+// TestStandardHostListTools_AlwaysConfirm pins how a tool's _meta maps to
+// Tool.AlwaysConfirm: true is every call, an object is the argument values
+// to match, and anything else — including destructiveHint, which is only a
+// hint and still allows "Always Allow" — is no rule.
+func TestStandardHostListTools_AlwaysConfirm(t *testing.T) {
 	srv := mcplib.NewServer("test", "0.0.1")
 	noop := func(ctx context.Context, req *mcplib.ToolRequest) (*mcplib.ToolResponse, error) {
 		return mcplib.NewToolResponseText("ok"), nil
 	}
-	srv.RegisterTool(mcplib.NewTool("wipe", "destructive").Destructive(true), noop)
-	srv.RegisterTool(mcplib.NewTool("add", "additive").Destructive(false), noop)
-	srv.RegisterTool(mcplib.NewTool("read", "read only").ReadOnly(), noop)
-	srv.RegisterTool(mcplib.NewTool("plain", "no hints"), noop)
+	srv.RegisterTool(mcplib.NewTool("wipe", "always").Meta(AlwaysConfirmMetaKey, true), noop)
+	srv.RegisterTool(mcplib.NewTool("run_script", "on write").Meta(AlwaysConfirmMetaKey, map[string]any{"mode": "write"}), noop)
+	srv.RegisterTool(mcplib.NewTool("off", "explicitly off").Meta(AlwaysConfirmMetaKey, false), noop)
+	srv.RegisterTool(mcplib.NewTool("delete", "destructive hint only").Destructive(true), noop)
+	srv.RegisterTool(mcplib.NewTool("plain", "nothing"), noop)
 	h := &StandardHost{MCPServer: func(ctx context.Context) *mcplib.Server { return srv }}
 
 	tools, err := h.ListTools(context.Background())
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
 	}
-	got := map[string]bool{}
+	rules := map[string]ConfirmRule{}
 	for _, tool := range tools {
-		got[tool.Name] = tool.Destructive
+		rules[tool.Name] = tool.AlwaysConfirm
 	}
-	want := map[string]bool{"wipe": true, "add": false, "read": false, "plain": false}
-	for name, w := range want {
-		d, ok := got[name]
-		if !ok {
-			t.Errorf("tool %q not listed", name)
-			continue
+	if r := rules["wipe"]; r == nil || len(r) != 0 {
+		t.Errorf("wipe: rule %#v, want every call", r)
+	}
+	if r := rules["run_script"]; len(r) != 1 || r["mode"] != "write" {
+		t.Errorf("run_script: rule %#v, want mode=write", r)
+	}
+	for _, name := range []string{"off", "delete", "plain"} {
+		if rules[name] != nil {
+			t.Errorf("%s: rule %#v, want none", name, rules[name])
 		}
-		if d != w {
-			t.Errorf("%s: Destructive = %v, want %v", name, d, w)
+	}
+}
+
+func TestConfirmRuleMatches(t *testing.T) {
+	cases := []struct {
+		rule ConfirmRule
+		args string
+		want bool
+	}{
+		{nil, `{}`, false},
+		{ConfirmRule{}, `{}`, true},
+		{ConfirmRule{}, `not json`, true},
+		{ConfirmRule{"mode": "write"}, `{"mode":"write"}`, true},
+		{ConfirmRule{"mode": "write"}, `{"mode":"read"}`, false},
+		{ConfirmRule{"mode": "write"}, `{}`, false},
+		{ConfirmRule{"mode": "write"}, `not json`, false},
+		{ConfirmRule{"n": 1}, `{"n":1.0}`, true},
+		{ConfirmRule{"force": true, "mode": "write"}, `{"force":true,"mode":"write"}`, true},
+		{ConfirmRule{"force": true, "mode": "write"}, `{"force":false,"mode":"write"}`, false},
+	}
+	for _, c := range cases {
+		if got := c.rule.Matches(json.RawMessage(c.args)); got != c.want {
+			t.Errorf("%#v.Matches(%s) = %v, want %v", c.rule, c.args, got, c.want)
 		}
 	}
 }

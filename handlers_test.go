@@ -1048,18 +1048,27 @@ func TestHandleCallTool_ModelReachesDiscoverableToolViaExecuteTool(t *testing.T)
 	}
 }
 
-// TestHandleChatMarksDestructiveToolCalls pins the always-confirm flag: a
-// tool_call event for a Destructive tool carries always_confirm, so the
-// browser asks every time; any other tool's event does not.
-func TestHandleChatMarksDestructiveToolCalls(t *testing.T) {
+// TestHandleChatMarksAlwaysConfirmToolCalls pins the always-confirm flag:
+// a tool_call event carries always_confirm when its tool's AlwaysConfirm
+// rule picks the call — every call for an empty rule, matching arguments
+// otherwise — and never for a tool with no rule.
+func TestHandleChatMarksAlwaysConfirmToolCalls(t *testing.T) {
 	host := &fakeHost{
 		tools: []Tool{
-			{Name: "run_script", Destructive: true},
+			{Name: "wipe", AlwaysConfirm: ConfirmRule{}},
+			{Name: "run_script", AlwaysConfirm: ConfirmRule{"mode": "write"}},
 			{Name: "search"},
 		},
 		complete: func(ctx context.Context, req CompleteRequest, events chan<- Event) error {
-			events <- Event{Type: EventToolCall, ToolCall: &ToolCall{ID: "call_1", Name: "run_script", Arguments: json.RawMessage(`{}`)}}
-			events <- Event{Type: EventToolCall, ToolCall: &ToolCall{ID: "call_2", Name: "search", Arguments: json.RawMessage(`{}`)}}
+			for _, c := range []ToolCall{
+				{ID: "1", Name: "wipe", Arguments: json.RawMessage(`{}`)},
+				{ID: "2", Name: "run_script", Arguments: json.RawMessage(`{"code":"x","mode":"write"}`)},
+				{ID: "3", Name: "run_script", Arguments: json.RawMessage(`{"code":"x","mode":"read"}`)},
+				{ID: "4", Name: "run_script", Arguments: json.RawMessage(`{"code":"x"}`)},
+				{ID: "5", Name: "search", Arguments: json.RawMessage(`{}`)},
+			} {
+				events <- Event{Type: EventToolCall, ToolCall: &c}
+			}
 			events <- Event{Type: EventDone, FinishReason: FinishToolCalls}
 			return nil
 		},
@@ -1072,7 +1081,6 @@ func TestHandleChatMarksDestructiveToolCalls(t *testing.T) {
 	s.handleChat(rec, req)
 
 	confirm := map[string]bool{}
-	seen := 0
 	for _, line := range strings.Split(rec.Body.String(), "\n") {
 		data, ok := strings.CutPrefix(line, "data: ")
 		if !ok {
@@ -1083,17 +1091,16 @@ func TestHandleChatMarksDestructiveToolCalls(t *testing.T) {
 			t.Fatalf("bad event %q: %v", data, err)
 		}
 		if ev.Type == EventToolCall {
-			seen++
-			confirm[ev.ToolCall.Name] = ev.AlwaysConfirm
+			confirm[ev.ToolCall.ID] = ev.AlwaysConfirm
 		}
 	}
-	if seen != 2 {
-		t.Fatalf("got %d tool_call events, want 2: %s", seen, rec.Body.String())
+	want := map[string]bool{"1": true, "2": true, "3": false, "4": false, "5": false}
+	if len(confirm) != len(want) {
+		t.Fatalf("got %d tool_call events, want %d: %s", len(confirm), len(want), rec.Body.String())
 	}
-	if !confirm["run_script"] {
-		t.Error("destructive tool's call lacks always_confirm")
-	}
-	if confirm["search"] {
-		t.Error("non-destructive tool's call carries always_confirm")
+	for id, w := range want {
+		if confirm[id] != w {
+			t.Errorf("call %s: always_confirm = %v, want %v", id, confirm[id], w)
+		}
 	}
 }

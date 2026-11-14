@@ -368,11 +368,11 @@ func convertMCPTools(tools []mcplib.MCPTool) []Tool {
 			visibility = ui.Visibility
 		}
 		out = append(out, Tool{
-			Name:        t.Name,
-			Description: t.Description,
-			InputSchema: schema,
-			Visibility:  visibility,
-			Destructive: t.Annotations != nil && t.Annotations.DestructiveHint != nil && *t.Annotations.DestructiveHint,
+			Name:          t.Name,
+			Description:   t.Description,
+			InputSchema:   schema,
+			Visibility:    visibility,
+			AlwaysConfirm: confirmRuleFromMeta(t.Meta),
 		})
 	}
 	return out

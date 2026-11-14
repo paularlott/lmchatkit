@@ -12,6 +12,7 @@ package lmchatkit
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 
 	mcplib "github.com/paularlott/mcp"
 )
@@ -93,18 +94,84 @@ type Model struct {
 // subset use [FilterToolsForModel]); it's carried here so the /api/tools/call
 // handler can enforce it without a second round trip to the MCP server.
 //
-// Destructive is set when the tool's annotations say destructiveHint: true.
-// A call to such a tool is always confirmed by the user: the chat never
-// auto-approves it, even when "Always Allow" was chosen for its name, and
-// does not offer "Always Allow" on its card. An absent hint does not count:
-// most tools state none, and treating them all as destructive (the spec's
-// default) would take "Always Allow" away from every tool.
+// AlwaysConfirm, when set, names the calls the user must confirm every time:
+// the chat never auto-approves them, even when "Always Allow" was chosen for
+// the tool, and offers no "Always Allow" on their card. Other calls to the
+// tool follow the normal flow. StandardHost reads it from the tool's
+// tools/list _meta under [AlwaysConfirmMetaKey].
 type Tool struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description,omitempty"`
-	InputSchema map[string]interface{} `json:"input_schema,omitempty"`
-	Visibility  []string               `json:"-"`
-	Destructive bool                   `json:"-"`
+	Name          string                 `json:"name"`
+	Description   string                 `json:"description,omitempty"`
+	InputSchema   map[string]interface{} `json:"input_schema,omitempty"`
+	Visibility    []string               `json:"-"`
+	AlwaysConfirm ConfirmRule            `json:"-"`
+}
+
+// AlwaysConfirmMetaKey is the tools/list _meta key an MCP server sets to have
+// calls to a tool confirmed every time, with no "Always Allow": true for every
+// call, or an object of argument values a call must all match to need it,
+// e.g. {"mode": "write"}.
+const AlwaysConfirmMetaKey = "lmchatkit/alwaysConfirm"
+
+// ConfirmRule picks the calls to a tool that must be confirmed every time.
+// Nil picks none; an empty, non-nil rule picks every call; otherwise a call
+// is picked when its arguments hold every listed value (an argument the call
+// leaves out does not match).
+type ConfirmRule map[string]any
+
+// Matches reports whether a call with these JSON arguments is picked.
+func (r ConfirmRule) Matches(arguments json.RawMessage) bool {
+	if r == nil {
+		return false
+	}
+	if len(r) == 0 {
+		return true
+	}
+	var args map[string]any
+	if err := json.Unmarshal(arguments, &args); err != nil {
+		return false
+	}
+	for name, want := range r {
+		got, ok := args[name]
+		if !ok || !sameJSONValue(got, want) {
+			return false
+		}
+	}
+	return true
+}
+
+// sameJSONValue compares two values as JSON, so 1 and 1.0, or a Go string
+// and a decoded one, compare equal.
+func sameJSONValue(a, b any) bool {
+	ja, errA := json.Marshal(a)
+	jb, errB := json.Marshal(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	var na, nb any
+	if json.Unmarshal(ja, &na) != nil || json.Unmarshal(jb, &nb) != nil {
+		return false
+	}
+	return reflect.DeepEqual(na, nb)
+}
+
+// confirmRuleFromMeta reads a tool's [AlwaysConfirmMetaKey] _meta entry:
+// true is every call, an object is the argument values to match, anything
+// else (or nothing) is no rule.
+func confirmRuleFromMeta(meta map[string]any) ConfirmRule {
+	switch v := meta[AlwaysConfirmMetaKey].(type) {
+	case bool:
+		if v {
+			return ConfirmRule{}
+		}
+	case map[string]any:
+		rule := make(ConfirmRule, len(v))
+		for k, val := range v {
+			rule[k] = val
+		}
+		return rule
+	}
+	return nil
 }
 
 // visibilityAllows reports whether visibility (a Tool's _meta.ui.visibility,
@@ -251,9 +318,9 @@ type Event struct {
 	Delta     string    `json:"delta,omitempty"`
 	Reasoning string    `json:"reasoning,omitempty"` // carries EventReasoning fragments
 	ToolCall  *ToolCall `json:"tool_call,omitempty"`
-	// AlwaysConfirm marks an [EventToolCall] for a [Tool] that is
-	// Destructive: the frontend asks the user every time and offers no
-	// "Always Allow". Set by the chat handler, not by hosts.
+	// AlwaysConfirm marks an [EventToolCall] its [Tool]'s AlwaysConfirm rule
+	// picks: the frontend asks the user every time and offers no "Always
+	// Allow". Set by the chat handler, not by hosts.
 	AlwaysConfirm bool         `json:"always_confirm,omitempty"`
 	FinishReason  FinishReason `json:"finish_reason,omitempty"`
 	Usage         *Usage       `json:"usage,omitempty"`

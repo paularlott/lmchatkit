@@ -114,12 +114,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	tools, _ := s.host.ListTools(r.Context())
 	tools = FilterToolsForModel(tools)
 
-	// Calls to destructive tools are confirmed every time: their tool_call
-	// events carry always_confirm, so the browser never auto-approves them.
-	alwaysConfirm := map[string]bool{}
+	// Calls a tool's AlwaysConfirm rule picks are confirmed every time: their
+	// tool_call events carry always_confirm, so the browser never
+	// auto-approves them.
+	confirmRules := map[string]ConfirmRule{}
 	for _, t := range tools {
-		if t.Destructive {
-			alwaysConfirm[t.Name] = true
+		if t.AlwaysConfirm != nil {
+			confirmRules[t.Name] = t.AlwaysConfirm
 		}
 	}
 
@@ -168,7 +169,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				goto finished
 			}
-			if ev.Type == EventToolCall && ev.ToolCall != nil && alwaysConfirm[ev.ToolCall.Name] {
+			if ev.Type == EventToolCall && ev.ToolCall != nil && confirmRules[ev.ToolCall.Name].Matches(ev.ToolCall.Arguments) {
 				ev.AlwaysConfirm = true
 			}
 			data, _ := json.Marshal(ev)
