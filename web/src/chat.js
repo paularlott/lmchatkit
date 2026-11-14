@@ -2062,14 +2062,18 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
           } else if (ev.type === "tool_call" && ev.tool_call) {
             // Auto-allow if the user previously chose "Always Allow" for this
             // tool in this conversation. Otherwise mark pending so the
-            // approval card renders at the bottom of the bubble.
-            const approved = this.autoAllowTools.includes(ev.tool_call.name);
+            // approval card renders at the bottom of the bubble. A call the
+            // server marks always_confirm (a destructive tool) is never
+            // auto-allowed, whatever the always-allow list holds.
+            const alwaysConfirm = !!ev.always_confirm;
+            const approved = !alwaysConfirm && this.autoAllowTools.includes(ev.tool_call.name);
             reactiveAssistant.tool_calls.push({
               id: ev.tool_call.id,
               name: ev.tool_call.name,
               arguments: safeParseArgs(ev.tool_call.arguments),
               approval: approved ? "approved" : "pending",
               auto: approved,
+              always_confirm: alwaysConfirm,
             });
             // A pending call renders an approval prompt — force it into
             // view immediately (the follow timer may not have ticked yet).
@@ -2342,10 +2346,12 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     // -- tool-call confirmation -------------------------------------------
     // approveToolCall fires when the user clicks Allow or Always Allow on
     // an inline tool-call card. `always` records the tool in the session's
-    // auto-allow set so future calls to the same tool skip the prompt.
+    // auto-allow set so future calls to the same tool skip the prompt —
+    // except for a call marked always_confirm (a destructive tool), which
+    // is approved this once and never remembered, whatever the card offered.
     async approveToolCall(call, always) {
       if (call.approval !== "pending") return;
-      if (always && !this.autoAllowTools.includes(call.name)) {
+      if (always && !call.always_confirm && !this.autoAllowTools.includes(call.name)) {
         this.autoAllowTools.push(call.name);
         sessionStorage.setItem("lmchatkit:autoAllow", JSON.stringify(this.autoAllowTools));
       }

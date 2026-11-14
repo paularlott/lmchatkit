@@ -1047,3 +1047,53 @@ func TestHandleCallTool_ModelReachesDiscoverableToolViaExecuteTool(t *testing.T)
 		})
 	}
 }
+
+// TestHandleChatMarksDestructiveToolCalls pins the always-confirm flag: a
+// tool_call event for a Destructive tool carries always_confirm, so the
+// browser asks every time; any other tool's event does not.
+func TestHandleChatMarksDestructiveToolCalls(t *testing.T) {
+	host := &fakeHost{
+		tools: []Tool{
+			{Name: "run_script", Destructive: true},
+			{Name: "search"},
+		},
+		complete: func(ctx context.Context, req CompleteRequest, events chan<- Event) error {
+			events <- Event{Type: EventToolCall, ToolCall: &ToolCall{ID: "call_1", Name: "run_script", Arguments: json.RawMessage(`{}`)}}
+			events <- Event{Type: EventToolCall, ToolCall: &ToolCall{ID: "call_2", Name: "search", Arguments: json.RawMessage(`{}`)}}
+			events <- Event{Type: EventDone, FinishReason: FinishToolCalls}
+			return nil
+		},
+	}
+	s := newTestServer(t, host)
+
+	body := `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/chat/api/chat", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.handleChat(rec, req)
+
+	confirm := map[string]bool{}
+	seen := 0
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		data, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
+			continue
+		}
+		var ev Event
+		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+			t.Fatalf("bad event %q: %v", data, err)
+		}
+		if ev.Type == EventToolCall {
+			seen++
+			confirm[ev.ToolCall.Name] = ev.AlwaysConfirm
+		}
+	}
+	if seen != 2 {
+		t.Fatalf("got %d tool_call events, want 2: %s", seen, rec.Body.String())
+	}
+	if !confirm["run_script"] {
+		t.Error("destructive tool's call lacks always_confirm")
+	}
+	if confirm["search"] {
+		t.Error("non-destructive tool's call carries always_confirm")
+	}
+}

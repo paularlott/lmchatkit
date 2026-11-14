@@ -92,11 +92,19 @@ type Model struct {
 // every tool regardless of visibility (callers needing the model-facing
 // subset use [FilterToolsForModel]); it's carried here so the /api/tools/call
 // handler can enforce it without a second round trip to the MCP server.
+//
+// Destructive is set when the tool's annotations say destructiveHint: true.
+// A call to such a tool is always confirmed by the user: the chat never
+// auto-approves it, even when "Always Allow" was chosen for its name, and
+// does not offer "Always Allow" on its card. An absent hint does not count:
+// most tools state none, and treating them all as destructive (the spec's
+// default) would take "Always Allow" away from every tool.
 type Tool struct {
 	Name        string                 `json:"name"`
 	Description string                 `json:"description,omitempty"`
 	InputSchema map[string]interface{} `json:"input_schema,omitempty"`
 	Visibility  []string               `json:"-"`
+	Destructive bool                   `json:"-"`
 }
 
 // visibilityAllows reports whether visibility (a Tool's _meta.ui.visibility,
@@ -239,13 +247,17 @@ const (
 // Event is one streamed server-sent event in the chat protocol. Type
 // determines which fields are meaningful.
 type Event struct {
-	Type         EventType    `json:"type"`
-	Delta        string       `json:"delta,omitempty"`
-	Reasoning    string       `json:"reasoning,omitempty"` // carries EventReasoning fragments
-	ToolCall     *ToolCall    `json:"tool_call,omitempty"`
-	FinishReason FinishReason `json:"finish_reason,omitempty"`
-	Usage        *Usage       `json:"usage,omitempty"`
-	Error        string       `json:"error,omitempty"`
+	Type      EventType `json:"type"`
+	Delta     string    `json:"delta,omitempty"`
+	Reasoning string    `json:"reasoning,omitempty"` // carries EventReasoning fragments
+	ToolCall  *ToolCall `json:"tool_call,omitempty"`
+	// AlwaysConfirm marks an [EventToolCall] for a [Tool] that is
+	// Destructive: the frontend asks the user every time and offers no
+	// "Always Allow". Set by the chat handler, not by hosts.
+	AlwaysConfirm bool         `json:"always_confirm,omitempty"`
+	FinishReason  FinishReason `json:"finish_reason,omitempty"`
+	Usage         *Usage       `json:"usage,omitempty"`
+	Error         string       `json:"error,omitempty"`
 }
 
 // Usage reports token counts for a completion, if known.

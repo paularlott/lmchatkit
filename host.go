@@ -372,6 +372,7 @@ func convertMCPTools(tools []mcplib.MCPTool) []Tool {
 			Description: t.Description,
 			InputSchema: schema,
 			Visibility:  visibility,
+			Destructive: t.Annotations != nil && t.Annotations.DestructiveHint != nil && *t.Annotations.DestructiveHint,
 		})
 	}
 	return out

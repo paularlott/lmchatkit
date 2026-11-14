@@ -114,6 +114,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	tools, _ := s.host.ListTools(r.Context())
 	tools = FilterToolsForModel(tools)
 
+	// Calls to destructive tools are confirmed every time: their tool_call
+	// events carry always_confirm, so the browser never auto-approves them.
+	alwaysConfirm := map[string]bool{}
+	for _, t := range tools {
+		if t.Destructive {
+			alwaysConfirm[t.Name] = true
+		}
+	}
+
 	// Inject the virtual skill-retrieval tool when skill:// resources
 	// exist. Server-side only — not in any user-visible tool list.
 	if s.hasSkillResources(r.Context()) {
@@ -158,6 +167,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		case ev, ok := <-events:
 			if !ok {
 				goto finished
+			}
+			if ev.Type == EventToolCall && ev.ToolCall != nil && alwaysConfirm[ev.ToolCall.Name] {
+				ev.AlwaysConfirm = true
 			}
 			data, _ := json.Marshal(ev)
 			w.Write([]byte("data: "))

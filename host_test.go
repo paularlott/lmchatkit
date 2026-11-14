@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	mcplib "github.com/paularlott/mcp"
@@ -260,10 +261,13 @@ func TestStandardHostCallTool_ExecuteToolMissingNameNoUI(t *testing.T) {
 
 	args, _ := json.Marshal(map[string]any{})
 	res, err := h.CallTool(context.Background(), mcplib.ExecuteToolName, args)
-	// handleExecuteTool returns a text response ("Tool name is required"),
-	// not an error — CallTool must reflect that, not panic or fabricate a UI.
-	if err != nil {
-		t.Fatalf("CallTool: %v", err)
+	// handleExecuteTool refuses the call (an invalid-params error naming the
+	// missing "name") — CallTool must pass that on, not panic or fabricate a UI.
+	if err == nil {
+		t.Fatal("CallTool accepted an execute_tool call with no name")
+	}
+	if !strings.Contains(err.Error(), `"name" is required`) {
+		t.Errorf("unexpected error: %v", err)
 	}
 	if res.UI != nil {
 		t.Errorf("expected no UI for a malformed execute_tool call, got %+v", res.UI)
@@ -535,5 +539,40 @@ func TestOpenAIChatRequest_SkipsUnsetParams(t *testing.T) {
 	}
 	if _, sent := OpenAIChatRequest(CompleteRequest{Model: "m"})["reasoning_effort"]; sent {
 		t.Error("reasoning_effort sent when never set")
+	}
+}
+
+// TestStandardHostListTools_Destructive pins how a tool's annotations map
+// to Tool.Destructive: only an explicit destructiveHint: true counts — an
+// absent hint (most tools) or an explicit false does not.
+func TestStandardHostListTools_Destructive(t *testing.T) {
+	srv := mcplib.NewServer("test", "0.0.1")
+	noop := func(ctx context.Context, req *mcplib.ToolRequest) (*mcplib.ToolResponse, error) {
+		return mcplib.NewToolResponseText("ok"), nil
+	}
+	srv.RegisterTool(mcplib.NewTool("wipe", "destructive").Destructive(true), noop)
+	srv.RegisterTool(mcplib.NewTool("add", "additive").Destructive(false), noop)
+	srv.RegisterTool(mcplib.NewTool("read", "read only").ReadOnly(), noop)
+	srv.RegisterTool(mcplib.NewTool("plain", "no hints"), noop)
+	h := &StandardHost{MCPServer: func(ctx context.Context) *mcplib.Server { return srv }}
+
+	tools, err := h.ListTools(context.Background())
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	got := map[string]bool{}
+	for _, tool := range tools {
+		got[tool.Name] = tool.Destructive
+	}
+	want := map[string]bool{"wipe": true, "add": false, "read": false, "plain": false}
+	for name, w := range want {
+		d, ok := got[name]
+		if !ok {
+			t.Errorf("tool %q not listed", name)
+			continue
+		}
+		if d != w {
+			t.Errorf("%s: Destructive = %v, want %v", name, d, w)
+		}
 	}
 }
