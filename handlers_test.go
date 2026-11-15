@@ -1066,6 +1066,10 @@ func TestHandleChatMarksAlwaysConfirmToolCalls(t *testing.T) {
 				{ID: "3", Name: "run_script", Arguments: json.RawMessage(`{"code":"x","mode":"read"}`)},
 				{ID: "4", Name: "run_script", Arguments: json.RawMessage(`{"code":"x"}`)},
 				{ID: "5", Name: "search", Arguments: json.RawMessage(`{}`)},
+				{ID: "6", Name: "execute_tool", Arguments: json.RawMessage(`{"name":"run_script","parameters":{"code":"x","mode":"write"}}`)},
+				{ID: "7", Name: "execute_tool", Arguments: json.RawMessage(`{"name":"run_script","parameters":{"code":"x","mode":"read"}}`)},
+				{ID: "8", Name: "execute_tool", Arguments: json.RawMessage(`{"name":"wipe"}`)},
+				{ID: "9", Name: "execute_tool", Arguments: json.RawMessage(`{"name":"search","parameters":{}}`)},
 			} {
 				events <- Event{Type: EventToolCall, ToolCall: &c}
 			}
@@ -1094,13 +1098,45 @@ func TestHandleChatMarksAlwaysConfirmToolCalls(t *testing.T) {
 			confirm[ev.ToolCall.ID] = ev.AlwaysConfirm
 		}
 	}
-	want := map[string]bool{"1": true, "2": true, "3": false, "4": false, "5": false}
+	want := map[string]bool{"1": true, "2": true, "3": false, "4": false, "5": false, "6": true, "7": false, "8": true, "9": false}
 	if len(confirm) != len(want) {
 		t.Fatalf("got %d tool_call events, want %d: %s", len(confirm), len(want), rec.Body.String())
 	}
 	for id, w := range want {
 		if confirm[id] != w {
 			t.Errorf("call %s: always_confirm = %v, want %v", id, confirm[id], w)
+		}
+	}
+}
+
+// TestMustConfirmThroughExecuteTool pins that a call wrapped in execute_tool
+// is judged as the tool it wraps, in every argument shape mcp.Server accepts,
+// and that wrapped arguments that cannot be read are confirmed.
+func TestMustConfirmThroughExecuteTool(t *testing.T) {
+	rules := map[string]ConfirmRule{"run_script": {"mode": "write"}}
+	cases := []struct {
+		name string
+		args string
+		want bool
+	}{
+		{"run_script", `{"mode":"write"}`, true},
+		{"run_script", `{"mode":"read"}`, false},
+		{"execute_tool", `{"name":"run_script","parameters":{"mode":"write"}}`, true},
+		{"execute_tool", `{"name":"run_script","arguments":{"mode":"write"}}`, true},
+		{"execute_tool", `{"name":"run_script","parameters":"{\"mode\":\"write\"}"}`, true},
+		{"execute_tool", `{"name":"run_script","parameters":{"mode":"read"}}`, false},
+		{"execute_tool", `{"name":"run_script"}`, false},
+		{"execute_tool", `{"name":"run_script","parameters":42}`, true},
+		{"execute_tool", `{"name":"run_script","parameters":{},"arguments":{"mode":"write"}}`, true},
+		{"execute_tool", `{"name":"other","parameters":{"mode":"write"}}`, false},
+		{"execute_tool", `{"name":"execute_tool","parameters":{"name":"run_script"}}`, false},
+		{"execute_tool", `{"name":"execute_tool","parameters":{"name":"run_script","parameters":{"mode":"write"}}}`, true},
+		{"execute_tool", `{"name":"execute_tool","parameters":{"name":"execute_tool","parameters":{"name":"run_script","parameters":{"mode":"write"}}}}`, true},
+		{"execute_tool", `{"name":"execute_tool","parameters":{"name":"run_script","parameters":{"mode":"read"}}}`, false},
+	}
+	for _, c := range cases {
+		if got := mustConfirm(rules, c.name, json.RawMessage(c.args)); got != c.want {
+			t.Errorf("%s %s: mustConfirm = %v, want %v", c.name, c.args, got, c.want)
 		}
 	}
 }

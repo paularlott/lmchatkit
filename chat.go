@@ -117,8 +117,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// Calls a tool's AlwaysConfirm rule picks are confirmed every time: their
 	// tool_call events carry always_confirm, so the browser never
 	// auto-approves them.
+	// The rules come from every tool, including discoverable ones the model
+	// reaches through execute_tool, when the host can list them.
 	confirmRules := map[string]ConfirmRule{}
-	for _, t := range tools {
+	ruleTools := tools
+	if all, ok := s.host.(AllToolsHost); ok {
+		if listed, err := all.ListAllTools(r.Context()); err == nil {
+			ruleTools = append(listed, tools...)
+		}
+	}
+	for _, t := range ruleTools {
 		if t.AlwaysConfirm != nil {
 			confirmRules[t.Name] = t.AlwaysConfirm
 		}
@@ -169,7 +177,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				goto finished
 			}
-			if ev.Type == EventToolCall && ev.ToolCall != nil && confirmRules[ev.ToolCall.Name].Matches(ev.ToolCall.Arguments) {
+			if ev.Type == EventToolCall && ev.ToolCall != nil && mustConfirm(confirmRules, ev.ToolCall.Name, ev.ToolCall.Arguments) {
 				ev.AlwaysConfirm = true
 			}
 			data, _ := json.Marshal(ev)

@@ -140,6 +140,70 @@ func (r ConfirmRule) Matches(arguments json.RawMessage) bool {
 	return true
 }
 
+// mustConfirm reports whether a tool call must be confirmed every time. A
+// call through the execute_tool meta-tool is judged as the tool it wraps,
+// with the wrapped arguments, so wrapping a tool cannot step around its
+// rule. Wrapped arguments that cannot be read are confirmed (fail closed).
+func mustConfirm(rules map[string]ConfirmRule, name string, arguments json.RawMessage) bool {
+	// execute_tool may wrap execute_tool (mcp.Server dispatches it again), so
+	// unwrap every level; past a sane depth, confirm.
+	target, args, ok := name, arguments, true
+	for depth := 0; ok && target == mcplib.ExecuteToolName; depth++ {
+		if depth == 8 {
+			return true
+		}
+		var unwrapped bool
+		target, args, ok, unwrapped = confirmTarget(target, args)
+		if !unwrapped {
+			break
+		}
+	}
+	rule := rules[target]
+	if rule == nil {
+		return false
+	}
+	return !ok || rule.Matches(args)
+}
+
+// confirmTarget unwraps an execute_tool call to the tool it runs and that
+// tool's arguments, read as mcp.Server reads them: "parameters" (or the older
+// "arguments"), an object or a string holding a JSON object. unwrapped is
+// false when the call is not a wrapping execute_tool call; ok is false when
+// the wrapped arguments cannot be read.
+func confirmTarget(name string, arguments json.RawMessage) (target string, args json.RawMessage, ok, unwrapped bool) {
+	if name != mcplib.ExecuteToolName {
+		return name, arguments, true, false
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(arguments, &raw); err != nil {
+		return name, arguments, true, false
+	}
+	inner, _ := raw["name"].(string)
+	if inner == "" {
+		return name, arguments, true, false
+	}
+	value, hasParams := raw["parameters"]
+	if legacy, ok := raw["arguments"]; ok {
+		if hasParams {
+			return inner, nil, false, true
+		}
+		value = legacy
+	}
+	switch v := value.(type) {
+	case nil:
+		return inner, json.RawMessage("{}"), true, true
+	case map[string]any:
+		b, err := json.Marshal(v)
+		return inner, b, err == nil, true
+	case string:
+		var obj map[string]any
+		if json.Unmarshal([]byte(v), &obj) == nil && obj != nil {
+			return inner, json.RawMessage(v), true, true
+		}
+	}
+	return inner, nil, false, true
+}
+
 // sameJSONValue compares two values as JSON, so 1 and 1.0, or a Go string
 // and a decoded one, compare equal.
 func sameJSONValue(a, b any) bool {

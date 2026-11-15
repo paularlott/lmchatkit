@@ -2065,12 +2065,16 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
             // approval card renders at the bottom of the bubble. A call the
             // server marks always_confirm (a destructive tool) is never
             // auto-allowed, whatever the always-allow list holds.
+            // A call through execute_tool is allowed by the tool it wraps,
+            // so "Always Allow" on one wrapped tool never covers the others.
             const alwaysConfirm = !!ev.always_confirm;
-            const approved = !alwaysConfirm && this.autoAllowTools.includes(ev.tool_call.name);
+            const args = safeParseArgs(ev.tool_call.arguments);
+            const allowName = hostToolNameFor({ name: ev.tool_call.name, arguments: args });
+            const approved = !alwaysConfirm && this.autoAllowTools.includes(allowName);
             reactiveAssistant.tool_calls.push({
               id: ev.tool_call.id,
               name: ev.tool_call.name,
-              arguments: safeParseArgs(ev.tool_call.arguments),
+              arguments: args,
               approval: approved ? "approved" : "pending",
               auto: approved,
               always_confirm: alwaysConfirm,
@@ -2351,8 +2355,9 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     // is approved this once and never remembered, whatever the card offered.
     async approveToolCall(call, always) {
       if (call.approval !== "pending") return;
-      if (always && !call.always_confirm && !this.autoAllowTools.includes(call.name)) {
-        this.autoAllowTools.push(call.name);
+      const allowName = hostToolNameFor(call);
+      if (always && !call.always_confirm && !this.autoAllowTools.includes(allowName)) {
+        this.autoAllowTools.push(allowName);
         sessionStorage.setItem("lmchatkit:autoAllow", JSON.stringify(this.autoAllowTools));
       }
       call.approval = "approving";
@@ -3248,10 +3253,15 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
 // is the Via of every app-proxy call; the namespace re-attachment for the
 // view's own bare tool names now happens server-side (handleAppProxy).
 function hostToolNameFor(call) {
-  if (call.name === "execute_tool" && call.arguments && typeof call.arguments.name === "string") {
-    return call.arguments.name;
+  // execute_tool can wrap execute_tool: unwrap every level.
+  let name = call.name;
+  let args = call.arguments;
+  for (let depth = 0; name === "execute_tool" && depth < 8; depth++) {
+    if (!args || typeof args.name !== "string" || !args.name) break;
+    name = args.name;
+    args = safeParseArgs(args.parameters ?? args.arguments);
   }
-  return call.name;
+  return name;
 }
 
 function safeParseArgs(raw) {
