@@ -89,7 +89,30 @@ type toolCallRequest struct {
 
 // handleCallTool invokes a tool. The frontend calls this after the user
 // confirms a tool call from the model's response, or (Source: "app") when a
-// mounted MCP Apps view calls a tool of its own.
+// mounted MCP Apps view calls a tool of its own (the bundled chat.js now
+// routes view calls through /api/app-proxy instead; Source "app" remains for
+// other clients).
+//
+// Trust model for always-confirm tools (Tool.AlwaysConfirm): the server
+// cannot see the approval click. A call without Source "app" is treated as a
+// model call the person approved in the chat UI, and runs; the approval card
+// itself (no Always Allow for always_confirm calls) is enforced by chat.js.
+// What the server does enforce:
+//   - App-view calls (Source "app" here, every /api/app-proxy tools/call)
+//     that an always-confirm rule picks are refused, since no card is ever
+//     shown for them.
+//   - A view cannot dress its call up as a model call: it runs in a
+//     sandboxed, opaque-origin iframe and reaches the server only through
+//     chat.js's postMessage bridge, which always posts to /api/app-proxy. A
+//     direct fetch or form post from the iframe carries "Origin: null"
+//     (Sec-Fetch-Site cross-site) and is refused by the CSRF guard, whatever
+//     the view's CSP (connect-src / form-action) allows.
+//   - Cross-site pages cannot post here at all (CSRF guard, see csrfGuard).
+//
+// Anything else holding the person's session — script running in the chat
+// page itself, or a non-browser client with their credentials — can still
+// post a "model" call directly; hosts must treat this endpoint as acting with
+// the session's full authority.
 func (s *Server) handleCallTool(w http.ResponseWriter, r *http.Request) {
 	var req toolCallRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -119,6 +142,15 @@ func (s *Server) handleCallTool(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, result)
 			return
 		}
+	}
+
+	// An app view's call is never shown to the person for approval, so a
+	// call an always-confirm rule picks is refused outright (see
+	// appCallNeedsConfirm). Before the visibility check, so the refusal does
+	// not depend on how the tool's visibility is declared.
+	if role == "app" && s.appCallNeedsConfirm(r.Context(), req.Name, req.Arguments) {
+		writeError(w, http.StatusForbidden, fmt.Sprintf("tool %q requires the person's confirmation and cannot be called from an app view", req.Name))
+		return
 	}
 
 	if !s.toolVisibilityAllows(r.Context(), visibilityTarget(req.Name, req.Arguments, role), role) {
@@ -219,6 +251,49 @@ func (s *Server) toolSourceAllows(ctx context.Context, viaTool, name string) boo
 		return false
 	}
 	return viaSource == targetSource
+}
+
+// confirmRules maps tool name to its AlwaysConfirm rule, for every tool
+// that has one: the tools given (the model-facing list handleChat already
+// fetched; nil to fetch Host.ListTools here) plus, when the host implements
+// [AllToolsHost], every discoverable tool the model reaches through
+// execute_tool. err reports any list that could not be read; the rules from
+// the lists that could are still returned.
+func (s *Server) confirmRules(ctx context.Context, tools []Tool) (map[string]ConfirmRule, error) {
+	var listErr error
+	if tools == nil {
+		tools, listErr = s.host.ListTools(ctx)
+	}
+	ruleTools := tools
+	if all, ok := s.host.(AllToolsHost); ok {
+		if listed, err := all.ListAllTools(ctx); err != nil {
+			listErr = err
+		} else {
+			ruleTools = append(listed, tools...)
+		}
+	}
+	rules := map[string]ConfirmRule{}
+	for _, t := range ruleTools {
+		if t.AlwaysConfirm != nil {
+			rules[t.Name] = t.AlwaysConfirm
+		}
+	}
+	return rules, listErr
+}
+
+// appCallNeedsConfirm reports whether a tool call made by an MCP App view
+// (source "app", or the app-proxy) must be refused because an always-confirm
+// rule picks it — judged after execute_tool unwrapping, as [mustConfirm]
+// judges model calls. The chat UI shows no approval card for a view's own
+// calls, so such a call could only ever run unconfirmed; it is refused
+// instead. Fails closed: if the tool lists cannot be read, the call is
+// refused.
+func (s *Server) appCallNeedsConfirm(ctx context.Context, name string, arguments json.RawMessage) bool {
+	rules, err := s.confirmRules(ctx, nil)
+	if err != nil {
+		return true
+	}
+	return mustConfirm(rules, name, arguments)
 }
 
 // handleListPrompts proxies the host's prompt list.
@@ -388,6 +463,14 @@ func (s *Server) handleAppProxy(w http.ResponseWriter, r *http.Request) {
 		// resolves; one that didn't gets its bare name dispatched home).
 		if namespace != "" && !strings.HasPrefix(name, namespace+mcplib.DefaultNamespaceSeparator) {
 			name = namespace + mcplib.DefaultNamespaceSeparator + name
+		}
+		// Refuse a call an always-confirm rule picks (execute_tool unwrapped)
+		// — a view's calls get no approval card, so it could only run
+		// unconfirmed. Judged on both the name the view sent and the
+		// reconstructed host-side name.
+		if s.appCallNeedsConfirm(r.Context(), params.Name, params.Arguments) || s.appCallNeedsConfirm(r.Context(), name, params.Arguments) {
+			writeError(w, http.StatusForbidden, fmt.Sprintf("tool %q requires the person's confirmation and cannot be called from an app view", name))
+			return
 		}
 		if !s.toolVisibilityAllows(r.Context(), name, "app") {
 			writeError(w, http.StatusForbidden, fmt.Sprintf("tool %q is not callable from this context", name))

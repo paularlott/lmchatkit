@@ -119,18 +119,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// auto-approves them.
 	// The rules come from every tool, including discoverable ones the model
 	// reaches through execute_tool, when the host can list them.
-	confirmRules := map[string]ConfirmRule{}
-	ruleTools := tools
-	if all, ok := s.host.(AllToolsHost); ok {
-		if listed, err := all.ListAllTools(r.Context()); err == nil {
-			ruleTools = append(listed, tools...)
-		}
-	}
-	for _, t := range ruleTools {
-		if t.AlwaysConfirm != nil {
-			confirmRules[t.Name] = t.AlwaysConfirm
-		}
-	}
+	confirmRules, _ := s.confirmRules(r.Context(), tools)
 
 	// Inject the virtual skill-retrieval tool when skill:// resources
 	// exist. Server-side only — not in any user-visible tool list.

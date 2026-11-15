@@ -63,6 +63,20 @@ type Config struct {
 	// MaxUploadBytes caps the size of a single uploaded file. Zero uses
 	// the default (10 MB).
 	MaxUploadBytes int64
+
+	// AllowedOrigins lists extra origins ("https://chat.example.com", scheme
+	// and host[:port], no path) allowed to make state-changing requests
+	// (POST/PUT/PATCH/DELETE). Every such route refuses a browser request
+	// from any other origin — see the CSRF rules on Server.csrfGuard. A
+	// same-origin page needs nothing here; list the public origin when a
+	// reverse proxy rewrites the Host header and does not set
+	// X-Forwarded-Host, or when another trusted origin embeds the chat.
+	AllowedOrigins []string
+
+	// TrustForwardedHost compares a request's Origin with the first
+	// X-Forwarded-Host value instead of the Host header. Set it only behind
+	// a reverse proxy that always sets (overwrites) X-Forwarded-Host.
+	TrustForwardedHost bool
 }
 
 // Server is a self-contained chat UI + backend. Build one with [New] and
@@ -147,7 +161,12 @@ func (e errString) Error() string { return string(e) }
 //   - {prefix}/api/...   — chat/tools/prompts/resources endpoints
 //   - {prefix}/assets/... — embedded chat.js, chat.css, markdown.js
 //
-// The host's AuthMiddleware (if set) wraps every handler.
+// The host's AuthMiddleware (if set) wraps every handler. Every
+// state-changing route (POST/PUT/PATCH/DELETE) is also wrapped, outside the
+// AuthMiddleware, in a CSRF guard: the request must be same-origin (or from
+// Config.AllowedOrigins, or carry no Origin at all, as a non-browser client
+// does) and send Content-Type application/json (multipart/form-data for the
+// upload). See [Server.csrfGuard].
 func (s *Server) Mount(mux *http.ServeMux) {
 	wrap := s.cfg.AuthMiddleware
 	if wrap == nil {
@@ -159,6 +178,12 @@ func (s *Server) Mount(mux *http.ServeMux) {
 			wrap(h).ServeHTTP(w, r)
 		}
 	}
+	// guarded wraps a state-changing route in the CSRF guard, outside the
+	// host's AuthMiddleware so a forged request is refused before it reaches
+	// the session.
+	guarded := func(h http.HandlerFunc, body requestBody) http.HandlerFunc {
+		return s.csrfGuard(wrapf(h), body).ServeHTTP
+	}
 
 	// API — method-specific patterns avoid conflicts with host catch-all
 	// routes (e.g. Go 1.22+ ServeMux "GET /" matches every path on GET,
@@ -166,18 +191,18 @@ func (s *Server) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+prefix+"/api/personas", wrapf(s.handlePersonas))
 	mux.HandleFunc("GET "+prefix+"/api/commands", wrapf(s.handleCommands))
 	mux.HandleFunc("GET "+prefix+"/api/models", wrapf(s.handleModels))
-	mux.HandleFunc("POST "+prefix+"/api/chat", wrapf(s.handleChat))
-	mux.HandleFunc("POST "+prefix+"/api/tools/call", wrapf(s.handleCallTool))
+	mux.HandleFunc("POST "+prefix+"/api/chat", guarded(s.handleChat, bodyJSON))
+	mux.HandleFunc("POST "+prefix+"/api/tools/call", guarded(s.handleCallTool, bodyJSON))
 	mux.HandleFunc("GET "+prefix+"/api/prompts", wrapf(s.handleListPrompts))
-	mux.HandleFunc("POST "+prefix+"/api/prompts/get", wrapf(s.handleGetPrompt))
+	mux.HandleFunc("POST "+prefix+"/api/prompts/get", guarded(s.handleGetPrompt, bodyJSON))
 	mux.HandleFunc("GET "+prefix+"/api/resources", wrapf(s.handleListResources))
-	mux.HandleFunc("POST "+prefix+"/api/resources/read", wrapf(s.handleReadResource))
-	mux.HandleFunc("POST "+prefix+"/api/app-proxy", wrapf(s.handleAppProxy))
+	mux.HandleFunc("POST "+prefix+"/api/resources/read", guarded(s.handleReadResource, bodyJSON))
+	mux.HandleFunc("POST "+prefix+"/api/app-proxy", guarded(s.handleAppProxy, bodyJSON))
 	mux.HandleFunc("GET "+prefix+"/api/config", wrapf(s.handleConfig))
 
 	// File upload — only mounted when enabled in Config.
 	if s.cfg.FileUpload {
-		mux.HandleFunc("POST "+prefix+"/api/upload", wrapf(s.handleUpload))
+		mux.HandleFunc("POST "+prefix+"/api/upload", guarded(s.handleUpload, bodyMultipart))
 	}
 
 	// Static assets (chat.js, chat.css, markdown.js bundles).
@@ -187,9 +212,9 @@ func (s *Server) Mount(mux *http.ServeMux) {
 	if s.cfg.History != nil {
 		mux.HandleFunc("GET "+prefix+"/api/conversations", wrapf(s.handleConversations))
 		mux.HandleFunc("GET "+prefix+"/api/conversations/", wrapf(s.handleConversation))
-		mux.HandleFunc("PUT "+prefix+"/api/conversations/", wrapf(s.handleConversation))
-		mux.HandleFunc("PATCH "+prefix+"/api/conversations/", wrapf(s.handleConversation))
-		mux.HandleFunc("DELETE "+prefix+"/api/conversations/", wrapf(s.handleConversation))
+		mux.HandleFunc("PUT "+prefix+"/api/conversations/", guarded(s.handleConversation, bodyJSON))
+		mux.HandleFunc("PATCH "+prefix+"/api/conversations/", guarded(s.handleConversation, bodyJSON))
+		mux.HandleFunc("DELETE "+prefix+"/api/conversations/", guarded(s.handleConversation, bodyNone))
 	}
 
 	// SSE event stream — only mounted when an EventBroadcaster is configured.
